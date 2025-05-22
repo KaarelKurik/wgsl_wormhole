@@ -1,0 +1,542 @@
+use std::{
+    f32::consts::PI,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use cgmath::{Array, InnerSpace, Matrix3, Rad, SquareMatrix, Vector3, Zero};
+use encase::{ShaderType, UniformBuffer};
+use wgpu::{util::{BufferInitDescriptor, DeviceExt}, *};
+use winit::{
+    application::ApplicationHandler,
+    dpi::PhysicalSize,
+    event::{self, DeviceEvent, ElementState, KeyEvent, MouseButton, WindowEvent},
+    event_loop,
+    keyboard::{KeyCode, PhysicalKey},
+    window::{self, CursorGrabMode, Window},
+};
+
+#[derive(Debug, Clone, Copy, ShaderType)]
+struct World {
+    index: u32,
+}
+
+#[derive(Debug, Clone, Copy, ShaderType)]
+struct Unifs {
+    camera: Camera,
+    world: World,
+}
+
+struct Keeper<T> {
+    val: T,
+    group: u32,
+    binding: u32,
+    changed: bool,
+}
+
+impl<T> Keeper<T> {
+    fn peek_val(&self) -> &T {
+        &self.val
+    }
+
+    fn get_val(&mut self) -> &mut T {
+        self.changed = true;
+        &mut self.val
+    }
+
+    fn group(&self) -> u32 {
+        self.group
+    }
+
+    fn binding(&self) -> u32 {
+        self.binding
+    }
+
+    fn reset(&mut self) {
+        self.changed = false;
+    }
+}
+#[derive(Debug, Clone, Copy, ShaderType)]
+struct Camera {
+    width: f32,
+    height: f32,
+    frame: Matrix3<f32>,
+    frame_inv: Matrix3<f32>,
+    centre: Vector3<f32>,
+    yfov: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CameraController {
+    q_state: ElementState,
+    e_state: ElementState,
+    w_state: ElementState,
+    s_state: ElementState,
+    a_state: ElementState,
+    d_state: ElementState,
+}
+
+impl Default for CameraController {
+    fn default() -> Self {
+        Self {
+            q_state: ElementState::Released,
+            e_state: ElementState::Released,
+            w_state: ElementState::Released,
+            s_state: ElementState::Released,
+            a_state: ElementState::Released,
+            d_state: ElementState::Released,
+        }
+    }
+}
+
+impl CameraController {
+    // TODO: modify this to use the metric
+    fn update_camera(&mut self, camera: &mut Camera, dt: Duration) {
+        const ANGULAR_SPEED: f32 = 1f32;
+        const LINEAR_SPEED: f32 = 8f32;
+        let dt_seconds = dt.as_secs_f32();
+
+        let mut linvel = Vector3::<f32>::zero();
+        let z_linvel = LINEAR_SPEED * Vector3::unit_z();
+        let x_linvel = LINEAR_SPEED * Vector3::unit_x();
+
+        if self.w_state.is_pressed() {
+            linvel += z_linvel;
+        }
+        if self.s_state.is_pressed() {
+            linvel -= z_linvel;
+        }
+        if self.d_state.is_pressed() {
+            linvel += x_linvel;
+        }
+        if self.a_state.is_pressed() {
+            linvel -= x_linvel;
+        }
+        camera.centre += camera.frame * (dt_seconds * linvel);
+
+        let mut rotvel = Vector3::<f32>::zero();
+        let z_rotvel = ANGULAR_SPEED * Vector3::unit_z();
+
+        if self.q_state.is_pressed() {
+            rotvel -= z_rotvel;
+        }
+        if self.e_state.is_pressed() {
+            rotvel += z_rotvel;
+        }
+        let axis = rotvel.normalize();
+        if axis.is_finite() {
+            camera.frame =
+                camera.frame * Matrix3::from_axis_angle(axis, Rad(dt_seconds * rotvel.magnitude()));
+        }
+        camera.frame_inv = camera.frame.invert().unwrap();
+    }
+    fn process_window_event(&mut self, event: &winit::event::WindowEvent) {
+        match event {
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(code),
+                        repeat: false,
+                        state,
+                        ..
+                    },
+                ..
+            } => match code {
+                // TODO: refactor this to have a single source of truth
+                KeyCode::KeyQ => self.q_state = *state,
+                KeyCode::KeyE => self.e_state = *state,
+                KeyCode::KeyW => self.w_state = *state,
+                KeyCode::KeyS => self.s_state = *state,
+                KeyCode::KeyA => self.a_state = *state,
+                KeyCode::KeyD => self.d_state = *state,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    fn process_mouse_motion(&mut self, camera: &mut Camera, delta: &(f64, f64)) {
+        const ANGULAR_SPEED: f32 = 0.001;
+        let dx = delta.0 as f32;
+        let dy = delta.1 as f32;
+        let angle = ANGULAR_SPEED * (dx.powi(2) + dy.powi(2)).sqrt();
+        let axis = Vector3 {
+            x: -dy,
+            y: dx,
+            z: 0.0,
+        }
+        .normalize();
+        camera.frame = camera.frame * Matrix3::from_axis_angle(axis, Rad(angle));
+    }
+}
+
+pub enum AppState<'a> {
+    Uninitialized(),
+    Initialized(App<'a>),
+}
+
+pub struct App<'a> {
+    window: Arc<Window>,
+    size: PhysicalSize<u32>,
+    surface: Surface<'a>,
+    surface_config: wgpu::SurfaceConfiguration,
+    device: Device,
+    queue: Queue,
+    mouse_capture_mode: CursorGrabMode,
+    cursor_is_visible: bool,
+    camera_controller: CameraController,
+    camera: Camera,
+    render_pipeline: RenderPipeline,
+    bg0: BindGroup,
+    fixed_time: Instant,
+    camera_buffer: Buffer,
+}
+
+impl<'a> App<'a> {
+    fn render(&mut self) -> Result<(), SurfaceError> {
+        self.sync_logic_to_gpu();
+        let output = self.surface.get_current_texture()?;
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("encoder"),
+            });
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("render_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.1,
+                            g: 0.2,
+                            b: 0.3,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, Some(&self.bg0), &[]);
+            render_pass.draw(0..3, 0..1);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+
+        Ok(())
+    }
+    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        if new_size.width > 0 && new_size.height > 0 {
+            self.size = new_size;
+            self.camera.height = new_size.height as f32;
+            self.camera.width = new_size.width as f32;
+            self.surface_config.width = new_size.width;
+            self.surface_config.height = new_size.height;
+            self.surface.configure(&self.device, &self.surface_config);
+        }
+    }
+    fn window_input(&mut self, event: &WindowEvent) {
+        self.camera_controller.process_window_event(event);
+        match event {
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => self.toggle_mouse_capture(),
+            _ => {}
+        }
+    }
+    fn toggle_mouse_capture(&mut self) {
+        let new_mode = match self.mouse_capture_mode {
+            CursorGrabMode::None => CursorGrabMode::Locked,
+            CursorGrabMode::Confined => CursorGrabMode::None,
+            CursorGrabMode::Locked => CursorGrabMode::None,
+        };
+        let fallback_mode = match self.mouse_capture_mode {
+            CursorGrabMode::None => CursorGrabMode::Confined,
+            CursorGrabMode::Confined => CursorGrabMode::None,
+            CursorGrabMode::Locked => CursorGrabMode::None,
+        };
+        let visibility = match new_mode {
+            CursorGrabMode::None => true,
+            CursorGrabMode::Confined => false,
+            CursorGrabMode::Locked => false,
+        };
+        if let Err(_) = self.window.set_cursor_grab(new_mode) {
+            self.window.set_cursor_grab(fallback_mode).unwrap();
+        }
+        self.window.set_cursor_visible(visibility);
+
+        self.mouse_capture_mode = new_mode;
+        self.cursor_is_visible = visibility;
+    }
+    fn device_input(&mut self, event: &DeviceEvent) {
+        match self.mouse_capture_mode {
+            CursorGrabMode::Confined | CursorGrabMode::Locked => {
+                if let DeviceEvent::MouseMotion { delta } = event {
+                    self.camera_controller
+                        .process_mouse_motion(&mut self.camera, delta);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn update_logic_state(&mut self, new_time: Instant) {
+        let dt = new_time.duration_since(self.fixed_time);
+        self.camera_controller.update_camera(&mut self.camera, dt);
+
+        // Write all deferrable logic (not rendering) changes.
+        // Maybe I should have wrapper logic just to set a bit telling me whether
+        // a change needs to be written?
+        self.fixed_time = new_time;
+    }
+    fn sync_logic_to_gpu(&mut self) {
+        let mut interim_buffer = UniformBuffer::new(Vec::<u8>::new());
+        interim_buffer.write(&self.camera).unwrap();
+        self.queue.write_buffer(&self.camera_buffer, 0, &interim_buffer.into_inner());
+    }
+}
+
+impl<'a> ApplicationHandler for AppState<'a> {
+    fn new_events(
+        &mut self,
+        _event_loop: &winit::event_loop::ActiveEventLoop,
+        cause: winit::event::StartCause,
+    ) {
+        match self {
+            AppState::Uninitialized() => {}
+            AppState::Initialized(app) => {
+                let new_time = Instant::now();
+                app.update_logic_state(new_time);
+                if cause == winit::event::StartCause::Poll {
+                    app.window.request_redraw();
+                }
+            }
+        }
+    }
+    fn resumed(&mut self, event_loop: &event_loop::ActiveEventLoop) {
+        if let AppState::Initialized(_) = self {
+            panic!("Tried to initialize already-initialized app!");
+        }
+
+        let window = Arc::new(
+            event_loop
+                .create_window(Window::default_attributes())
+                .unwrap(),
+        );
+
+        let size = window.as_ref().inner_size();
+
+        let instance = wgpu::Instance::new(&InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL,
+            ..Default::default()
+        });
+
+        let surface = instance.create_surface(window.clone()).unwrap();
+
+        let adapter_future = instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: Some(&surface),
+        });
+        let adapter = pollster::block_on(adapter_future).unwrap();
+
+        let surface_caps = surface.get_capabilities(&adapter);
+        let supported_presentation_modes = surface_caps.present_modes;
+
+        let mode_comparator = |pres_mode: &&wgpu::PresentMode| match pres_mode {
+            wgpu::PresentMode::Immediate => -1, // my machine freezes every few secs with vsync now - not sure why
+            wgpu::PresentMode::Mailbox => 0,
+            wgpu::PresentMode::FifoRelaxed => 1,
+            wgpu::PresentMode::Fifo => 2,
+            _ => 3,
+        };
+        let present_mode = *supported_presentation_modes
+            .iter()
+            .min_by_key(mode_comparator)
+            .unwrap();
+
+        let surface_format = surface_caps
+            .formats
+            .iter()
+            .find(|f| f.is_srgb())
+            .copied()
+            .unwrap_or(surface_caps.formats[0]);
+
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            width: size.width,
+            height: size.height,
+            present_mode,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: surface_caps.alpha_modes[0],
+            view_formats: vec![],
+        };
+
+        let device_future = adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("device"),
+            required_features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+            required_limits: wgpu::Limits {
+                max_bind_groups: 5,
+                ..Default::default()
+            },
+            memory_hints: wgpu::MemoryHints::default(),
+            trace: wgpu::Trace::Off,
+        });
+        let (device, queue) = pollster::block_on(device_future).unwrap();
+
+        surface.configure(&device, &surface_config); // causes segfault if device, surface_config die.
+
+        let shader_module = device.create_shader_module(include_wgsl!("shaders/test.wgsl"));
+
+        let camera = Camera {
+            width: size.width as f32,
+            height: size.height as f32,
+            frame: Matrix3::identity(),
+            frame_inv: Matrix3::identity(),
+            centre: Vector3::new(0.0, 0.0, 0.0),
+            yfov: PI / 4.0,
+        };
+
+        let mut camera_interim_buffer = UniformBuffer::new(Vec::<u8>::new());
+        camera_interim_buffer.write(&camera).unwrap();
+        let camera_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("camera_buffer"),
+            contents: &camera_interim_buffer.into_inner(),
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        });
+
+        let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("bg0_layout"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::all(),
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let bg0 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("bg0"),
+            layout: &bg0_layout,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::Buffer(BufferBinding {
+                    buffer: &camera_buffer,
+                    offset: 0,
+                    size: None,
+                }),
+            }],
+        });
+
+        let render_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("render_pipeline_layout"),
+            bind_group_layouts: &[&bg0_layout],
+            push_constant_ranges: &[],
+        });
+
+        let render_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("render_pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: VertexState {
+                module: &shader_module,
+                entry_point: Some("vtx_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: Some(Face::Back),
+                unclipped_depth: false,
+                polygon_mode: PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            fragment: Some(FragmentState {
+                module: &shader_module,
+                entry_point: Some("frag_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format: surface_format,
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            multiview: None,
+            cache: None,
+        });
+        let fixed_time = Instant::now();
+
+        *self = AppState::Initialized(App {
+            window,
+            surface,
+            size,
+            surface_config,
+            device,
+            queue,
+            mouse_capture_mode: CursorGrabMode::None,
+            cursor_is_visible: true,
+            camera,
+            camera_controller: Default::default(),
+            camera_buffer,
+            render_pipeline,
+            bg0,
+            fixed_time,
+        })
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &event_loop::ActiveEventLoop,
+        _window_id: window::WindowId,
+        event: event::WindowEvent,
+    ) {
+        match self {
+            AppState::Uninitialized() => {}
+            AppState::Initialized(app) => match event {
+                WindowEvent::CloseRequested => {
+                    println!("The close button was pressed; stopping");
+                    event_loop.exit();
+                }
+                WindowEvent::RedrawRequested => match app.render() {
+                    Ok(_) => {}
+                    Err(SurfaceError::Lost) => app.resize(app.size),
+                    Err(SurfaceError::OutOfMemory) => event_loop.exit(),
+                    Err(e) => eprintln!("{:?}", e),
+                },
+                WindowEvent::Resized(new_size) => app.resize(new_size),
+                e => app.window_input(&e),
+            },
+        }
+    }
+    fn device_event(
+        &mut self,
+        _event_loop: &winit::event_loop::ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: winit::event::DeviceEvent,
+    ) {
+        match self {
+            AppState::Uninitialized() => {}
+            AppState::Initialized(app) => app.device_input(&event),
+        }
+    }
+}

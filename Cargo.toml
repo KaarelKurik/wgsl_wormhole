@@ -1,0 +1,11 @@
+[package]
+name = "wgsl_wormhole"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cgmath = "0.18.0"
+encase = { version = "0.11.0", features = ["cgmath"] }
+pollster = "0.4.0"
+wgpu = "25.0.0"
+winit = "0.30.11"
