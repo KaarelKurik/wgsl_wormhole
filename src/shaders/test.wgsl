@@ -13,6 +13,9 @@ struct TR3 {
 }
 
 @binding(0) @group(0) var<uniform> camera : Camera;
+@binding(1) @group(0) var sampler0 : sampler;
+@binding(0) @group(1) var skybox_array : texture_cube_array<f32>;
+
 
 fn fragpos_to_ray(camera: Camera, pos: vec2f)->TR3 {
     let ray_coords = normalize(vec3f( // Note the normalization - if camera frame is orthonormal, ray will be also
@@ -38,5 +41,6 @@ fn vtx_main(@builtin(vertex_index) vertex_index : u32) -> @builtin(position) vec
 @fragment
 fn frag_main(@builtin(position) in : vec4<f32>) -> @location(0) vec4f {
   let ray = fragpos_to_ray(camera, in.xy);
-  return vec4(ray.v, 1.0);
+  let color = textureSample(skybox_array, sampler0, ray.v, 1);
+  return color;
 }

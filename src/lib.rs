@@ -1,12 +1,19 @@
 use std::{
+    array,
     f32::consts::PI,
+    num::NonZero,
+    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use cgmath::{Array, InnerSpace, Matrix3, Rad, SquareMatrix, Vector3, Zero};
 use encase::{ShaderType, UniformBuffer};
-use wgpu::{util::{BufferInitDescriptor, DeviceExt}, *};
+use image::{EncodableLayout, ImageBuffer, ImageError, RgbaImage, imageops::FilterType};
+use wgpu::{
+    util::{BufferInitDescriptor, DeviceExt},
+    *,
+};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -169,6 +176,176 @@ impl CameraController {
     }
 }
 
+// Has to have equal resolution on all faces
+struct RgbaSkybox {
+    px: RgbaImage,
+    nx: RgbaImage,
+    py: RgbaImage,
+    ny: RgbaImage,
+    pz: RgbaImage,
+    nz: RgbaImage,
+}
+
+impl RgbaSkybox {
+    fn dimensions(&self) -> (u32, u32) {
+        self.px.dimensions()
+    }
+    fn width(&self) -> u32 {
+        self.px.width()
+    }
+    fn height(&self) -> u32 {
+        self.px.height()
+    }
+    fn extent(&self) -> Extent3d {
+        Extent3d {
+            width: self.width(),
+            height: self.height(),
+            depth_or_array_layers: 6,
+        }
+    }
+    fn texture_format(&self) -> TextureFormat {
+        TextureFormat::Rgba8UnormSrgb
+    }
+    fn descriptor(&self) -> TextureDescriptor {
+        TextureDescriptor {
+            label: None,
+            size: self.extent(),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: self.texture_format(),
+            usage: TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        }
+    }
+    fn view_descriptor(&self) -> TextureViewDescriptor {
+        TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::Cube),
+            format: Some(self.texture_format()),
+            ..Default::default()
+        }
+    }
+    fn as_bytevec(&self) -> Vec<u8> {
+        [
+            self.px.as_bytes(),
+            self.nx.as_bytes(),
+            self.py.as_bytes(),
+            self.ny.as_bytes(),
+            self.pz.as_bytes(),
+            self.nz.as_bytes(),
+        ]
+        .concat()
+    }
+    fn bytes_per_block(&self) -> u32 {
+        4
+    }
+    fn load_from_path(bg_path: &Path) -> Result<Self, ImageError> {
+        let [px, nx, py, ny, pz, nz]: [Result<_, ImageError>; 6] =
+            ["right", "left", "bottom", "top", "front", "back"].map(|x| {
+                let mut im = image::open(bg_path.join(format!("{}.png", x)))?.into_rgba8();
+                image::imageops::flip_vertical_in_place(&mut im);
+                Ok(im)
+            });
+        Ok(RgbaSkybox {
+            px: px?,
+            nx: nx?,
+            py: py?,
+            ny: ny?,
+            pz: pz?,
+            nz: nz?,
+        })
+    }
+    fn resize(&self, nwidth: u32, nheight: u32, filter: FilterType) -> RgbaSkybox {
+        RgbaSkybox {
+            px: image::imageops::resize(&self.px, nwidth, nheight, filter),
+            nx: image::imageops::resize(&self.nx, nwidth, nheight, filter),
+            py: image::imageops::resize(&self.py, nwidth, nheight, filter),
+            ny: image::imageops::resize(&self.ny, nwidth, nheight, filter),
+            pz: image::imageops::resize(&self.pz, nwidth, nheight, filter),
+            nz: image::imageops::resize(&self.nz, nwidth, nheight, filter),
+        }
+    }
+}
+
+struct SkyboxArray {
+    dimensions: (u32, u32),
+    skyboxes: Vec<RgbaSkybox>,
+}
+
+impl SkyboxArray {
+    fn width(&self) -> u32 {
+        self.dimensions.0
+    }
+    fn height(&self) -> u32 {
+        self.dimensions.1
+    }
+    fn extent(&self) -> Extent3d {
+        Extent3d {
+            width: self.width(),
+            height: self.height(),
+            depth_or_array_layers: 6 * self.skyboxes.len() as u32,
+        }
+    }
+    fn texture_format(&self) -> TextureFormat {
+        TextureFormat::Rgba8UnormSrgb
+    }
+    fn descriptor(&self) -> TextureDescriptor {
+        TextureDescriptor {
+            label: None,
+            size: self.extent(),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: self.texture_format(),
+            usage: TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        }
+    }
+    fn view_descriptor(&self) -> TextureViewDescriptor {
+        TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::CubeArray),
+            format: Some(self.texture_format()),
+            ..Default::default()
+        }
+    }
+    fn as_bytevec(&self) -> Vec<u8> {
+        self.skyboxes
+            .iter()
+            .map(|q| q.as_bytevec())
+            .collect::<Vec<_>>()
+            .concat()
+    }
+    fn new(skyboxes: &[RgbaSkybox], width: u32, height: u32) -> Self {
+        Self {
+            dimensions: (width, height),
+            skyboxes: skyboxes
+                .iter()
+                .map(|sb| sb.resize(width, height, FilterType::Nearest))
+                .collect(),
+        }
+    }
+    fn bytes_per_block(&self) -> u32 {
+        4
+    }
+    fn write_texture(&self, texture: &Texture, queue: &Queue) {
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: texture,
+                mip_level: 0,
+                origin: Origin3d { x: 0, y: 0, z: 0 },
+                aspect: TextureAspect::All,
+            },
+            &self.as_bytevec(),
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(self.bytes_per_block() * self.width()),
+                rows_per_image: Some(self.height()),
+            },
+            self.extent(),
+        );
+    }
+}
+
 pub enum AppState<'a> {
     Uninitialized(),
     Initialized(App<'a>),
@@ -189,6 +366,7 @@ pub struct App<'a> {
     bg0: BindGroup,
     fixed_time: Instant,
     camera_buffer: Buffer,
+    skyboxes_bind_group: BindGroup,
 }
 
 impl<'a> App<'a> {
@@ -225,6 +403,7 @@ impl<'a> App<'a> {
             });
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, Some(&self.bg0), &[]);
+            render_pass.set_bind_group(1, Some(&self.skyboxes_bind_group), &[]);
             render_pass.draw(0..3, 0..1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -300,7 +479,8 @@ impl<'a> App<'a> {
     fn sync_logic_to_gpu(&mut self) {
         let mut interim_buffer = UniformBuffer::new(Vec::<u8>::new());
         interim_buffer.write(&self.camera).unwrap();
-        self.queue.write_buffer(&self.camera_buffer, 0, &interim_buffer.into_inner());
+        self.queue
+            .write_buffer(&self.camera_buffer, 0, &interim_buffer.into_inner());
     }
 }
 
@@ -383,8 +563,10 @@ impl<'a> ApplicationHandler for AppState<'a> {
 
         let device_future = adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("device"),
-            required_features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+            required_features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+                | Features::TEXTURE_BINDING_ARRAY,
             required_limits: wgpu::Limits {
+                max_binding_array_elements_per_shader_stage: 4,
                 max_bind_groups: 5,
                 ..Default::default()
             },
@@ -403,7 +585,7 @@ impl<'a> ApplicationHandler for AppState<'a> {
             frame: Matrix3::identity(),
             frame_inv: Matrix3::identity(),
             centre: Vector3::new(0.0, 0.0, 0.0),
-            yfov: PI / 4.0,
+            yfov: PI / 2.0,
         };
 
         let mut camera_interim_buffer = UniformBuffer::new(Vec::<u8>::new());
@@ -414,36 +596,86 @@ impl<'a> ApplicationHandler for AppState<'a> {
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         });
 
+        let skybox_names = ["bg_debug", "bg0"];
+        let skyboxes: Vec<RgbaSkybox> = skybox_names
+            .iter()
+            .map(|p| RgbaSkybox::load_from_path(Path::new(&format!("textures/{}", p))).unwrap())
+            .collect();
+        let skybox_array = SkyboxArray::new(&skyboxes, 1024, 1024);
+        let skybox_array_texture = device.create_texture(&skybox_array.descriptor());
+        skybox_array.write_texture(&skybox_array_texture, &queue);
+        let skybox_array_texture_view =
+            skybox_array_texture.create_view(&skybox_array.view_descriptor());
+        let skybox_sampler = device.create_sampler(&SamplerDescriptor::default());
+
         let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("bg0_layout"),
-            entries: &[BindGroupLayoutEntry {
-                binding: 0,
-                visibility: ShaderStages::all(),
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::all(),
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::all(),
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
 
         let bg0 = device.create_bind_group(&BindGroupDescriptor {
             label: Some("bg0"),
             layout: &bg0_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::Buffer(BufferBinding {
+                        buffer: &camera_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::Sampler(&skybox_sampler),
+                },
+            ],
+        });
+
+        let skyboxes_bind_group_layout =
+            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("skyboxes_bind_group_layout"),
+                entries: &[BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::all(),
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::CubeArray,
+                        multisampled: false,
+                    },
+                    count: Some(NonZero::new(skybox_array.skyboxes.len() as u32).unwrap()),
+                }],
+            });
+
+        let skyboxes_bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("skyboxes_bind_group"),
+            layout: &skyboxes_bind_group_layout,
             entries: &[BindGroupEntry {
                 binding: 0,
-                resource: BindingResource::Buffer(BufferBinding {
-                    buffer: &camera_buffer,
-                    offset: 0,
-                    size: None,
-                }),
+                resource: BindingResource::TextureView(&skybox_array_texture_view),
             }],
         });
 
         let render_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("render_pipeline_layout"),
-            bind_group_layouts: &[&bg0_layout],
+            bind_group_layouts: &[&bg0_layout, &skyboxes_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -500,6 +732,7 @@ impl<'a> ApplicationHandler for AppState<'a> {
             camera_buffer,
             render_pipeline,
             bg0,
+            skyboxes_bind_group,
             fixed_time,
         })
     }
