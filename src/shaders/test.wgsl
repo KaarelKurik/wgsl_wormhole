@@ -29,19 +29,31 @@ fn transform_hermite(tf: mat4x4<f32>, h: Hermite) -> Hermite {
   return Hermite(transform_bound_vec(tf, h.pos), transform_free_vec(tf, h.normal));
 }
 
+fn transform_qv(tf: mat4x4<f32>, qv: TR3) -> TR3 {
+  return TR3(transform_bound_vec(tf, qv.q), transform_free_vec(tf, qv.v));
+}
+
 struct SituatedPoint {
   chart_index: u32,
   q: vec3f,
+}
+
+struct SituatedTR3 {
+  chart_index: u32,
+  q: vec3f,
+  v: vec3f,
 }
 
 struct SituatedTransform {
   chart_index: u32,
   local_to_global: mat4x4<f32>,
   global_to_local: mat4x4<f32>,
+  global_to_local_norm: f32,
 }
 
 struct ThroatMetadata {
   transforms: array<SituatedTransform, 2>,
+  half_throat_indices: array<u32, 2>,
   point_count: u32, // we assume >= 1
   support: f32,
   outer_length: f32,
@@ -190,8 +202,8 @@ fn project_onto_surface(kth_throat: u32, x: vec3f, delta: f32) -> vec3f {
   var grad = surface_energy_gradient(kth_throat, x, delta);
   for (var k: u32 = 0; k < KSTEPS; k++) {
     base = x - lambda * grad;
-    grad = surface_energy_gradient(kth_throat, base, delta);
-    lambda += surface_energy(kth_throat, base)/dot(grad, grad);
+    grad = surface_energy_gradient(kth_throat, base, delta); // could make cheaper by doing pushforward directly
+    lambda += surface_energy(kth_throat, base)/dot(grad, grad); // might have to be dot(grad1, grad0) instead
   }
   return base;
 }
@@ -299,15 +311,45 @@ fn one_outer_step(kth_throat: u32, qv: TR3) -> TR3 {
   return TR3(qv.q + delta * qv.v, qv.v);
 }
 
+struct StepBoundRes {
+  bound: f32,
+  near: bool,
+}
+
+fn step_length_bound(kth_throat: u32, q: vec3f) -> StepBoundRes {
+  let energy = surface_energy(kth_throat, q);
+  let outer_length = throat_metas[kth_throat].outer_length;
+  let delta = energy - outer_length;
+  let near = delta <= 0.2 * outer_length;
+  return StepBoundRes(delta, near);
+}
+
 struct OuterStepRes {
-  min_energy_index: u32,
+  min_energy_half_throat_index: u32,
   close_to_throat: bool,
   qv: TR3,
 }
 
-fn one_outer_step_all_global(nth_chart: u32, gqv: TR3) -> TR3 {
-  var step_delta = 20; // max step length
-  return gqv;
+fn one_outer_step_all_global(nth_chart: u32, gqv: TR3) -> OuterStepRes {
+  var step_length = 20.0; // max step length
+  var min_index: u32 = 0;
+  for (var i: u32 = half_throat_range_start_by_chart_index[nth_chart]; i < half_throat_range_end_by_chart_index[nth_chart]; i++) {
+    let ht = half_throats[i];
+    let tm = throat_metas[ht.throat_index];
+    let gtl = tm.transforms[ht.side].global_to_local;
+    let gtl_norm = tm.transforms[ht.side].global_to_local_norm;
+    let lqv = transform_qv(gtl, gqv);
+    let boundres = step_length_bound(ht.throat_index, lqv.q);
+    if (boundres.near) {
+      return OuterStepRes(i, true, gqv);
+    }
+    let br = boundres.bound / gtl_norm;
+    if (br < step_length) {
+      step_length = br;
+      min_index = i;
+    }
+  }
+  return OuterStepRes(min_index, false, TR3(gqv.q + step_length * normalize(gqv.v), gqv.v));
 }
 
 fn one_throat_step(kth_throat: u32, qv: TR3, dt:f32, delta: f32) -> TR3 {
@@ -321,6 +363,112 @@ fn one_throat_step(kth_throat: u32, qv: TR3, dt:f32, delta: f32) -> TR3 {
   return TR3(qv.q + (dt/6)*(k1.q + 2*k2.q + 2*k3.q + k4.q), qv.v + (dt/6)*(k1.v + 2*k2.v + 2*k3.v + k4.v));
 }
 
+fn ambient_step(aqv: SituatedTR3) -> SituatedTR3 {
+  let ambient_step_res = one_outer_step_all_global(aqv.chart_index, TR3(aqv.q, aqv.v));
+  if (ambient_step_res.close_to_throat) {
+    let half_throat_index = ambient_step_res.min_energy_half_throat_index;
+    let gtl = global_to_local(half_throat_index);
+    let transformed_qv = transform_qv(gtl, ambient_step_res.qv);
+    let chart_index = half_throat_index_to_chart_index(half_throat_index);
+    return SituatedTR3(chart_index, transformed_qv.q, transformed_qv.v);
+  }
+  return SituatedTR3(aqv.chart_index, ambient_step_res.qv.q, ambient_step_res.qv.v);
+}
+
+fn throat_side_transition(tq: SituatedPoint, diff_scale: f32) -> SituatedPoint {
+  let half_throat_index = chart_index_to_half_throat_index(tq.chart_index);
+  let op_index = opposite_half_throat_index(half_throat_index);
+  let op_chart_index = half_throat_index_to_chart_index(op_index);
+  let half_throat = half_throats[half_throat_index];
+  let throat_index = half_throat.throat_index;
+  let outer_length = throat_metas[throat_index].outer_length;
+  let bd = base_and_delta(throat_index, tq.q, diff_scale);
+  let new_v = (outer_length - length(bd.v)) * normalize(bd.v);
+  let new_pos = bd.q + new_v;
+  return SituatedPoint(op_chart_index, new_pos);
+}
+
+fn throat_side_transition_pushforward(tqv: SituatedTR3, diff_scale: f32) -> SituatedTR3 {
+  let tq = SituatedPoint(tqv.chart_index, tqv.q);
+  let scale_factor = length(tqv.v)/diff_scale;
+  let tqd = SituatedPoint(tqv.chart_index, tqv.q + diff_scale * normalize(tqv.v));
+  let fv = throat_side_transition(tq, diff_scale);
+  let fvdv = throat_side_transition(tqd, diff_scale);
+  let new_chart_index = fv.chart_index;
+  let new_v = scale_factor * (fvdv.q - fv.q);
+  return SituatedTR3(new_chart_index, fv.q, new_v);
+}
+
+fn throat_step(tqv: SituatedTR3, diff_scale: f32, time_scale: f32) -> SituatedTR3 {
+  let half_throat_index = chart_index_to_half_throat_index(tqv.chart_index);
+  let half_throat = half_throats[half_throat_index];
+  let throat_index = half_throat.throat_index;
+  let simple_throat_step_res = one_throat_step(throat_index, TR3(tqv.q, tqv.v), time_scale, diff_scale);
+  let new_base_and_delta = base_and_delta(throat_index, simple_throat_step_res.q, diff_scale);
+  let outer_length = throat_metas[throat_index].outer_length;
+  if (length(new_base_and_delta.v) < 0.3 * outer_length) { // magic number
+    return throat_side_transition_pushforward(SituatedTR3(tqv.chart_index, simple_throat_step_res.q, simple_throat_step_res.v), diff_scale);
+  }
+  if (length(new_base_and_delta.v) >= 1.2 * outer_length) { // synced with 0.2 in step_length_bound 
+    // transform simple step res to ambient
+    let situated_transform = throat_metas[throat_index].transforms[half_throat.side];
+    let gqv = transform_qv(situated_transform.local_to_global, TR3(simple_throat_step_res.q, simple_throat_step_res.v));
+    let ambient_index = situated_transform.chart_index;
+    return SituatedTR3(ambient_index, gqv.q, gqv.v);
+  }
+  return SituatedTR3(tqv.chart_index, simple_throat_step_res.q, simple_throat_step_res.v);
+}
+
+fn one_general_step(qv: SituatedTR3, diff_scale: f32, time_scale: f32) -> SituatedTR3 {
+  if (qv_is_in_ambient(qv)) {
+    return ambient_step(qv);
+  }
+  return throat_step(qv, diff_scale, time_scale);
+}
+
+fn transform_ambient_to_half_throat(half_throat_index: u32, aqv: SituatedTR3) -> SituatedTR3 {
+  let half_throat = half_throats[half_throat_index];
+}
+
+fn local_to_global(half_throat_index: u32) -> mat4x4f {
+  let half_throat = half_throats[half_throat_index];
+  let transforms = throat_metas[half_throat.throat_index].transforms[half_throat.side];
+  return transforms.local_to_global;
+}
+
+fn global_to_local(half_throat_index: u32) -> mat4x4f {
+  let half_throat = half_throats[half_throat_index];
+  let transforms = throat_metas[half_throat.throat_index].transforms[half_throat.side];
+  return transforms.global_to_local;
+}
+
+fn count_ambient_chart_indices() -> u32 {
+  return arrayLength(&half_throat_range_end_by_chart_index);
+}
+
+fn chart_is_ambient(chart_index: u32) -> bool {
+  return chart_index < count_ambient_chart_indices();
+}
+
+fn chart_index_to_half_throat_index(chart_index: u32) -> u32 {
+  return chart_index - count_ambient_chart_indices();
+}
+
+fn half_throat_index_to_chart_index(half_throat_index: u32) -> u32 {
+  return half_throat_index + count_ambient_chart_indices();
+}
+
+fn opposite_half_throat_index(half_throat_index: u32) -> u32 {
+  let ht = half_throats[half_throat_index];
+  let throat_index = ht.throat_index;
+  let tm = throat_metas[throat_index];
+  return tm.half_throat_indices[1-ht.side];
+}
+
+fn qv_is_in_ambient(qv: SituatedTR3) -> bool {
+  return chart_is_ambient(qv.chart_index);
+}
+
 @binding(0) @group(0) var<uniform> camera : Camera;
 @binding(1) @group(0) var sampler0 : sampler;
 
@@ -330,6 +478,8 @@ fn one_throat_step(kth_throat: u32, qv: TR3, dt:f32, delta: f32) -> TR3 {
 @binding(1) @group(2) var<storage> throat_point_starts: array<u32>;
 @binding(2) @group(2) var<storage> throat_local_points: array<Hermite>;
 @binding(3) @group(2) var<storage> half_throats: array<HalfThroatData>;
+@binding(4) @group(2) var<storage> half_throat_range_start_by_chart_index: array<u32>;
+@binding(5) @group(2) var<storage> half_throat_range_end_by_chart_index: array<u32>;
 
 fn index_throat_point(kth_throat: u32, nth_point: u32) -> Hermite {
   return throat_local_points[throat_point_starts[kth_throat] + nth_point];
