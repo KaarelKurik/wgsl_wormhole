@@ -1,14 +1,14 @@
 use std::{
     array,
-    f32::consts::PI,
+    f32::consts::{PI, TAU},
     num::NonZero,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use cgmath::{Array, InnerSpace, Matrix3, Rad, SquareMatrix, Vector3, Zero};
-use encase::{ShaderType, UniformBuffer};
+use cgmath::{Array, InnerSpace, Matrix3, Matrix4, Rad, SquareMatrix, Vector3, Zero};
+use encase::{ShaderType, StorageBuffer, UniformBuffer, internal::WriteInto};
 use image::{EncodableLayout, ImageBuffer, ImageError, RgbaImage, imageops::FilterType};
 use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
@@ -22,17 +22,6 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{self, CursorGrabMode, Window},
 };
-
-#[derive(Debug, Clone, Copy, ShaderType)]
-struct World {
-    index: u32,
-}
-
-#[derive(Debug, Clone, Copy, ShaderType)]
-struct Unifs {
-    camera: Camera,
-    world: World,
-}
 
 struct Keeper<T> {
     val: T,
@@ -63,6 +52,7 @@ impl<T> Keeper<T> {
         self.changed = false;
     }
 }
+
 #[derive(Debug, Clone, Copy, ShaderType)]
 struct Camera {
     width: f32,
@@ -71,6 +61,55 @@ struct Camera {
     frame_inv: Matrix3<f32>,
     centre: Vector3<f32>,
     yfov: f32,
+    chart_index: u32,
+}
+
+#[derive(Debug, Clone, Copy, ShaderType)]
+struct TR3 {
+    q: Vector3<f32>,
+    v: Vector3<f32>,
+}
+
+#[derive(Debug, Clone, Copy, ShaderType)]
+struct Hermite {
+    pos: Vector3<f32>,
+    normal: Vector3<f32>,
+}
+
+#[derive(Debug, Clone, Copy, ShaderType)]
+struct SituatedPoint {
+    chart_index: u32,
+    q: Vector3<f32>,
+}
+
+#[derive(Debug, Clone, Copy, ShaderType)]
+struct SituatedTR3 {
+    chart_index: u32,
+    q: Vector3<f32>,
+    v: Vector3<f32>,
+}
+
+#[derive(Debug, Clone, Copy, ShaderType)]
+struct SituatedTransform {
+    chart_index: u32,
+    local_to_global: Matrix4<f32>,
+    global_to_local: Matrix4<f32>,
+    global_to_local_norm: f32,
+}
+
+#[derive(Debug, Clone, Copy, ShaderType)]
+struct ThroatMetadata {
+    transforms: [SituatedTransform; 2],
+    half_throat_indices: [u32; 2],
+    point_count: u32,
+    support: f32,
+    outer_length: f32,
+}
+
+#[derive(Debug, Clone, Copy, ShaderType)]
+struct HalfThroatData {
+    throat_index: u32,
+    side: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -174,6 +213,34 @@ impl CameraController {
         .normalize();
         camera.frame = camera.frame * Matrix3::from_axis_angle(axis, Rad(angle));
     }
+}
+
+// m >= 2
+fn sphere(m: usize, n: usize) -> Vec<Hermite> {
+    let mut out = Vec::with_capacity((m - 2) * n + 2);
+    out.push(Hermite {
+        pos: Vector3::unit_z(),
+        normal: Vector3::unit_z(),
+    });
+    for i in 1..(m - 1) {
+        let psi = (i as f32 / (m - 1) as f32) * PI;
+        for j in 0..n {
+            let phi = (j as f32 / n as f32) * TAU;
+            let v = Vector3::new(phi.cos() * psi.sin(), phi.sin() * psi.sin(), psi.cos());
+            out.push(Hermite { pos: v, normal: v });
+        }
+    }
+    out.push(Hermite {
+        pos: -Vector3::unit_z(),
+        normal: -Vector3::unit_z(),
+    });
+    out
+}
+
+fn interim_storage_buffer<T: ShaderType + WriteInto>(st: &T) -> StorageBuffer<Vec<u8>> {
+    let mut o = StorageBuffer::new(Vec::<u8>::new());
+    o.write(st);
+    o
 }
 
 // Has to have equal resolution on all faces
@@ -367,6 +434,7 @@ pub struct App<'a> {
     fixed_time: Instant,
     camera_buffer: Buffer,
     skyboxes_bind_group: BindGroup,
+    geometry_bind_group: BindGroup,
 }
 
 impl<'a> App<'a> {
@@ -404,6 +472,7 @@ impl<'a> App<'a> {
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, Some(&self.bg0), &[]);
             render_pass.set_bind_group(1, Some(&self.skyboxes_bind_group), &[]);
+            render_pass.set_bind_group(2, Some(&self.geometry_bind_group), &[]);
             render_pass.draw(0..3, 0..1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -584,8 +653,9 @@ impl<'a> ApplicationHandler for AppState<'a> {
             height: size.height as f32,
             frame: Matrix3::identity(),
             frame_inv: Matrix3::identity(),
-            centre: Vector3::new(0.0, 0.0, 0.0),
+            centre: Vector3::new(0.0, 0.0, -5.0),
             yfov: PI / 2.0,
+            chart_index: 0,
         };
 
         let mut camera_interim_buffer = UniformBuffer::new(Vec::<u8>::new());
@@ -596,7 +666,7 @@ impl<'a> ApplicationHandler for AppState<'a> {
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         });
 
-        let skybox_names = ["bg_debug", "bg0"];
+        let skybox_names = ["bg0", "bg_debug"];
         let skyboxes: Vec<RgbaSkybox> = skybox_names
             .iter()
             .map(|p| RgbaSkybox::load_from_path(Path::new(&format!("textures/{}", p))).unwrap())
@@ -673,9 +743,211 @@ impl<'a> ApplicationHandler for AppState<'a> {
             }],
         });
 
+        let tf0 = SituatedTransform {
+            chart_index: 0,
+            local_to_global: Matrix4::identity(),
+            global_to_local: Matrix4::identity(),
+            global_to_local_norm: 1.0,
+        };
+
+        let tf1 = SituatedTransform {
+            chart_index: 1,
+            local_to_global: Matrix4::identity(),
+            global_to_local: Matrix4::identity(),
+            global_to_local_norm: 1.0,
+        };
+
+        let throat_points = sphere(10, 10);
+
+        let main_throat = ThroatMetadata {
+            transforms: [tf0, tf1],
+            half_throat_indices: [0, 1],
+            point_count: throat_points.len() as u32,
+            support: 0.4,
+            outer_length: 0.3,
+        };
+
+        let ht0 = HalfThroatData {
+            throat_index: 0,
+            side: 0,
+        };
+
+        let ht1 = HalfThroatData {
+            throat_index: 0,
+            side: 1,
+        };
+
+        let throat_metas = vec![main_throat];
+        let throat_point_starts = vec![0u32];
+        let throat_local_points = throat_points;
+        let half_throats = vec![ht0, ht1];
+        let half_throat_range_start_by_chart_index = vec![0u32, 1];
+        let half_throat_range_end_by_chart_index = vec![1u32, 2];
+
+        let throat_metas_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("throat_metas_buffer"),
+            contents: &interim_storage_buffer(&throat_metas).into_inner(),
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        });
+        let throat_point_starts_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("throat_point_starts_buffer"),
+            contents: &interim_storage_buffer(&throat_point_starts).into_inner(),
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        });
+        let throat_local_points_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("throat_local_points_buffer"),
+            contents: &interim_storage_buffer(&throat_local_points).into_inner(),
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        });
+        let half_throats_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("half_throats_buffer"),
+            contents: &interim_storage_buffer(&half_throats).into_inner(),
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        });
+        let half_throat_range_start_by_chart_index_buffer =
+            device.create_buffer_init(&BufferInitDescriptor {
+                label: Some("half_throat_range_start_by_chart_index_buffer"),
+                contents: &interim_storage_buffer(&half_throat_range_start_by_chart_index)
+                    .into_inner(),
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            });
+        let half_throat_range_end_by_chart_index_buffer =
+            device.create_buffer_init(&BufferInitDescriptor {
+                label: Some("half_throat_range_end_by_chart_index_buffer"),
+                contents: &interim_storage_buffer(&half_throat_range_end_by_chart_index)
+                    .into_inner(),
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            });
+
+        let geometry_bind_group_layout =
+            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("geometry_bind_group_layout"),
+                entries: &[
+                    BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: ShaderStages::all(),
+                        ty: BindingType::Buffer {
+                            ty: BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: ShaderStages::all(),
+                        ty: BindingType::Buffer {
+                            ty: BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: ShaderStages::all(),
+                        ty: BindingType::Buffer {
+                            ty: BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: ShaderStages::all(),
+                        ty: BindingType::Buffer {
+                            ty: BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: ShaderStages::all(),
+                        ty: BindingType::Buffer {
+                            ty: BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: ShaderStages::all(),
+                        ty: BindingType::Buffer {
+                            ty: BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let geometry_bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("geometry_bind_group"),
+            layout: &geometry_bind_group_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::Buffer(BufferBinding {
+                        buffer: &throat_metas_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::Buffer(BufferBinding {
+                        buffer: &throat_point_starts_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::Buffer(BufferBinding {
+                        buffer: &throat_local_points_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: BindingResource::Buffer(BufferBinding {
+                        buffer: &half_throats_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                BindGroupEntry {
+                    binding: 4,
+                    resource: BindingResource::Buffer(BufferBinding {
+                        buffer: &half_throat_range_start_by_chart_index_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                BindGroupEntry {
+                    binding: 5,
+                    resource: BindingResource::Buffer(BufferBinding {
+                        buffer: &half_throat_range_end_by_chart_index_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+            ],
+        });
+
         let render_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("render_pipeline_layout"),
-            bind_group_layouts: &[&bg0_layout, &skyboxes_bind_group_layout],
+            bind_group_layouts: &[
+                &bg0_layout,
+                &skyboxes_bind_group_layout,
+                &geometry_bind_group_layout,
+            ],
             push_constant_ranges: &[],
         });
 
@@ -733,6 +1005,7 @@ impl<'a> ApplicationHandler for AppState<'a> {
             render_pipeline,
             bg0,
             skyboxes_bind_group,
+            geometry_bind_group,
             fixed_time,
         })
     }

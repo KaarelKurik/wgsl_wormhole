@@ -1,3 +1,6 @@
+// guidelines:
+// chart indices cover ambient charts, then half-throat charts after that
+
 struct Camera {
     width: f32,
     height: f32,
@@ -5,6 +8,7 @@ struct Camera {
     frame_inv: mat3x3<f32>,
     centre: vec3<f32>,
     yfov: f32,
+    chart_index: u32,
 }
 
 struct TR3 {
@@ -426,9 +430,14 @@ fn one_general_step(qv: SituatedTR3, diff_scale: f32, time_scale: f32) -> Situat
   return throat_step(qv, diff_scale, time_scale);
 }
 
-fn transform_ambient_to_half_throat(half_throat_index: u32, aqv: SituatedTR3) -> SituatedTR3 {
-  let half_throat = half_throats[half_throat_index];
+fn many_steps(qv: SituatedTR3, kiter: u32, diff_scale: f32, time_scale: f32) -> SituatedTR3 {
+  var iqv = qv;
+  for (var i: u32 = 0; i < kiter; i++) {
+    iqv = one_general_step(qv, diff_scale, time_scale);
+  }
+  return iqv;
 }
+
 
 fn local_to_global(half_throat_index: u32) -> mat4x4f {
   let half_throat = half_throats[half_throat_index];
@@ -472,7 +481,7 @@ fn qv_is_in_ambient(qv: SituatedTR3) -> bool {
 @binding(0) @group(0) var<uniform> camera : Camera;
 @binding(1) @group(0) var sampler0 : sampler;
 
-@binding(0) @group(1) var skybox_array : texture_cube_array<f32>;
+@binding(0) @group(1) var skybox_array : texture_cube_array<f32>; // uses chart indices
 
 @binding(0) @group(2) var<storage> throat_metas: array<ThroatMetadata>;
 @binding(1) @group(2) var<storage> throat_point_starts: array<u32>;
@@ -485,14 +494,14 @@ fn index_throat_point(kth_throat: u32, nth_point: u32) -> Hermite {
   return throat_local_points[throat_point_starts[kth_throat] + nth_point];
 }
 
-fn fragpos_to_ray(camera: Camera, pos: vec2f)->TR3 {
+fn fragpos_to_ray(camera: Camera, pos: vec2f)->SituatedTR3 {
     let ray_coords = normalize(vec3f( // Note the normalization - if camera frame is orthonormal, ray will be also
         (pos.x / camera.width - 0.5) * (camera.width / camera.height),
         pos.y / camera.height - 0.5,
         0.5 / (tan(camera.yfov / 2.0))
     ));
     let ray = camera.frame * ray_coords;
-    return TR3(camera.centre, ray);
+    return SituatedTR3(camera.chart_index, camera.centre, ray);
 }
 
 @vertex
@@ -509,6 +518,11 @@ fn vtx_main(@builtin(vertex_index) vertex_index : u32) -> @builtin(position) vec
 @fragment
 fn frag_main(@builtin(position) in : vec4<f32>) -> @location(0) vec4f {
   let ray = fragpos_to_ray(camera, in.xy);
-  let color = textureSample(skybox_array, sampler0, ray.v, 1);
-  return color;
+  let diff_scale = 0.01;
+  let time_scale = 0.05;
+  let stepped_ray = many_steps(ray, 800, diff_scale, time_scale);
+  if (qv_is_in_ambient(stepped_ray)) {
+    return textureSample(skybox_array, sampler0, stepped_ray.v, stepped_ray.chart_index);
+  }
+  return vec4f(1.0, 1.0, 0.0, 1.0);
 }
