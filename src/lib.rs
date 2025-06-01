@@ -475,7 +475,8 @@ impl<'a> App<'a> {
             render_pass.set_bind_group(2, Some(&self.geometry_bind_group), &[]);
             render_pass.draw(0..3, 0..1);
         }
-        self.queue.submit(std::iter::once(encoder.finish()));
+        let index = self.queue.submit(std::iter::once(encoder.finish()));
+        self.device.poll(MaintainBase::WaitForSubmissionIndex(index)).unwrap();
         output.present();
 
         Ok(())
@@ -757,13 +758,13 @@ impl<'a> ApplicationHandler for AppState<'a> {
             global_to_local_norm: 1.0,
         };
 
-        let throat_points = sphere(10, 10);
+        let throat_points = sphere(40, 40);
 
         let main_throat = ThroatMetadata {
             transforms: [tf0, tf1],
             half_throat_indices: [0, 1],
             point_count: throat_points.len() as u32,
-            support: 0.4,
+            support: 0.3,
             outer_length: 0.3,
         };
 

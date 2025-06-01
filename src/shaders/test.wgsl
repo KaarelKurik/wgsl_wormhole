@@ -72,7 +72,7 @@ fn wendland(h: f32, x: f32) -> f32 {
     if (x > h) {
         return 0.0;
     } else {
-        var t = 1 - x / h;
+        var t: f32 = 1.0 - x / h;
         t = t * t;
         t = t * t;
         return t * (4 * x / h + 1);
@@ -132,33 +132,34 @@ fn distant_energy(kth_throat: u32, x: vec3f) -> f32 {
     let dist = length(x-ith_hermite.pos);
     if (dist < mindist) {
       outenergy = dot(x-ith_hermite.pos, ith_hermite.normal);
+      mindist = dist;
     }
   }
   return outenergy;
 }
 
-fn distant_energy_global_coords(half_throat_index: u32, gx: vec3f) -> f32 {
-  let ht = half_throats[half_throat_index];
-  let throat_index = ht.throat_index;
-  let transform = throat_metas[throat_index].transforms[ht.side];
-  let point_count = throat_metas[throat_index].point_count;
-  let ltg = transform.local_to_global;
+// fn distant_energy_global_coords(half_throat_index: u32, gx: vec3f) -> f32 {
+//   let ht = half_throats[half_throat_index];
+//   let throat_index = ht.throat_index;
+//   let transform = throat_metas[throat_index].transforms[ht.side];
+//   let point_count = throat_metas[throat_index].point_count;
+//   let ltg = transform.local_to_global;
 
-  let zeroth_local_hermite = index_throat_point(throat_index, 0);
-  let zeroth_hermite = transform_hermite(ltg, zeroth_local_hermite);
-  var mindist: f32 = length(gx - zeroth_hermite.pos);
+//   let zeroth_local_hermite = index_throat_point(throat_index, 0);
+//   let zeroth_hermite = transform_hermite(ltg, zeroth_local_hermite);
+//   var mindist: f32 = length(gx - zeroth_hermite.pos);
 
-  var outenergy = dot(gx-zeroth_hermite.pos, zeroth_hermite.normal);
-  for (var i : u32 = 1; i < point_count; i++) {
-    let ith_local_hermite = index_throat_point(throat_index, i);
-    let ith_hermite = transform_hermite(ltg, ith_local_hermite);
-    let dist = length(gx-ith_hermite.pos);
-    if (dist < mindist) {
-      outenergy = dot(gx-ith_hermite.pos, ith_hermite.normal);
-    }
-  }
-  return outenergy;
-}
+//   var outenergy = dot(gx-zeroth_hermite.pos, zeroth_hermite.normal);
+//   for (var i : u32 = 1; i < point_count; i++) {
+//     let ith_local_hermite = index_throat_point(throat_index, i);
+//     let ith_hermite = transform_hermite(ltg, ith_local_hermite);
+//     let dist = length(gx-ith_hermite.pos);
+//     if (dist < mindist) {
+//       outenergy = dot(gx-ith_hermite.pos, ith_hermite.normal);
+//     }
+//   }
+//   return outenergy;
+// }
 
 // x throat local coords
 fn surface_energy(kth_throat: u32, x: vec3f) -> f32 {
@@ -172,20 +173,20 @@ fn surface_energy(kth_throat: u32, x: vec3f) -> f32 {
 // NB! Not the same function as surface energy under a different chart.
 // Reason why is that we need to know the "true" ambient distance
 // to do the ray marching correctly.
-fn surface_energy_global_coords(half_throat_index: u32, gx: vec3f) -> f32 {
-  let ht = half_throats[half_throat_index];
-  let throat_index = ht.throat_index;
-  let transform = throat_metas[throat_index].transforms[ht.side];
-  let gtl = transform.global_to_local;
-  let ltg = transform.local_to_global;
-  let lx = transform_bound_vec(gtl, gx);
-  let lcr = local_centroid(throat_index, lx);
-  if (lcr.near) {
-    let gh = transform_hermite(ltg, lcr.h);
-    return dot(gh.normal, gx - gh.pos);
-  }
-  return distant_energy_global_coords(throat_index, gx);
-}
+// fn surface_energy_global_coords(half_throat_index: u32, gx: vec3f) -> f32 {
+//   let ht = half_throats[half_throat_index];
+//   let throat_index = ht.throat_index;
+//   let transform = throat_metas[throat_index].transforms[ht.side];
+//   let gtl = transform.global_to_local;
+//   let ltg = transform.local_to_global;
+//   let lx = transform_bound_vec(gtl, gx);
+//   let lcr = local_centroid(throat_index, lx);
+//   if (lcr.near) {
+//     let gh = transform_hermite(ltg, lcr.h);
+//     return dot(gh.normal, gx - gh.pos);
+//   }
+//   return distant_energy_global_coords(throat_index, gx);
+// }
 
 // Numerical. Might be risky to do it this way.
 // Probably if any of our diffs should be done symbolically, it's this.
@@ -370,11 +371,12 @@ fn one_throat_step(kth_throat: u32, qv: TR3, dt:f32, delta: f32) -> TR3 {
 fn ambient_step(aqv: SituatedTR3) -> SituatedTR3 {
   let ambient_step_res = one_outer_step_all_global(aqv.chart_index, TR3(aqv.q, aqv.v));
   if (ambient_step_res.close_to_throat) {
-    let half_throat_index = ambient_step_res.min_energy_half_throat_index;
-    let gtl = global_to_local(half_throat_index);
-    let transformed_qv = transform_qv(gtl, ambient_step_res.qv);
-    let chart_index = half_throat_index_to_chart_index(half_throat_index);
-    return SituatedTR3(chart_index, transformed_qv.q, transformed_qv.v);
+    return SituatedTR3(400, vec3f(0), vec3f(0));
+    // let half_throat_index = ambient_step_res.min_energy_half_throat_index;
+    // let gtl = global_to_local(half_throat_index);
+    // let transformed_qv = transform_qv(gtl, ambient_step_res.qv);
+    // let chart_index = half_throat_index_to_chart_index(half_throat_index);
+    // return SituatedTR3(chart_index, transformed_qv.q, transformed_qv.v);
   }
   return SituatedTR3(aqv.chart_index, ambient_step_res.qv.q, ambient_step_res.qv.v);
 }
@@ -404,23 +406,24 @@ fn throat_side_transition_pushforward(tqv: SituatedTR3, diff_scale: f32) -> Situ
 }
 
 fn throat_step(tqv: SituatedTR3, diff_scale: f32, time_scale: f32) -> SituatedTR3 {
-  let half_throat_index = chart_index_to_half_throat_index(tqv.chart_index);
-  let half_throat = half_throats[half_throat_index];
-  let throat_index = half_throat.throat_index;
-  let simple_throat_step_res = one_throat_step(throat_index, TR3(tqv.q, tqv.v), time_scale, diff_scale);
-  let new_base_and_delta = base_and_delta(throat_index, simple_throat_step_res.q, diff_scale);
-  let outer_length = throat_metas[throat_index].outer_length;
-  if (length(new_base_and_delta.v) < 0.3 * outer_length) { // magic number
-    return throat_side_transition_pushforward(SituatedTR3(tqv.chart_index, simple_throat_step_res.q, simple_throat_step_res.v), diff_scale);
-  }
-  if (length(new_base_and_delta.v) >= 1.2 * outer_length) { // synced with 0.2 in step_length_bound 
-    // transform simple step res to ambient
-    let situated_transform = throat_metas[throat_index].transforms[half_throat.side];
-    let gqv = transform_qv(situated_transform.local_to_global, TR3(simple_throat_step_res.q, simple_throat_step_res.v));
-    let ambient_index = situated_transform.chart_index;
-    return SituatedTR3(ambient_index, gqv.q, gqv.v);
-  }
-  return SituatedTR3(tqv.chart_index, simple_throat_step_res.q, simple_throat_step_res.v);
+  return tqv;
+  // let half_throat_index = chart_index_to_half_throat_index(tqv.chart_index);
+  // let half_throat = half_throats[half_throat_index];
+  // let throat_index = half_throat.throat_index;
+  // let simple_throat_step_res = one_throat_step(throat_index, TR3(tqv.q, tqv.v), time_scale, diff_scale);
+  // let new_base_and_delta = base_and_delta(throat_index, simple_throat_step_res.q, diff_scale);
+  // let outer_length = throat_metas[throat_index].outer_length;
+  // if (length(new_base_and_delta.v) < 0.3 * outer_length) { // magic number
+  //   return throat_side_transition_pushforward(SituatedTR3(tqv.chart_index, simple_throat_step_res.q, simple_throat_step_res.v), diff_scale);
+  // }
+  // if (length(new_base_and_delta.v) >= 1.2 * outer_length) { // synced with 0.2 in step_length_bound 
+  //   // transform simple step res to ambient
+  //   let situated_transform = throat_metas[throat_index].transforms[half_throat.side];
+  //   let gqv = transform_qv(situated_transform.local_to_global, TR3(simple_throat_step_res.q, simple_throat_step_res.v));
+  //   let ambient_index = situated_transform.chart_index;
+  //   return SituatedTR3(ambient_index, gqv.q, gqv.v);
+  // }
+  // return SituatedTR3(tqv.chart_index, simple_throat_step_res.q, simple_throat_step_res.v);
 }
 
 fn one_general_step(qv: SituatedTR3, diff_scale: f32, time_scale: f32) -> SituatedTR3 {
@@ -433,7 +436,7 @@ fn one_general_step(qv: SituatedTR3, diff_scale: f32, time_scale: f32) -> Situat
 fn many_steps(qv: SituatedTR3, kiter: u32, diff_scale: f32, time_scale: f32) -> SituatedTR3 {
   var iqv = qv;
   for (var i: u32 = 0; i < kiter; i++) {
-    iqv = one_general_step(qv, diff_scale, time_scale);
+    iqv = one_general_step(iqv, diff_scale, time_scale);
   }
   return iqv;
 }
