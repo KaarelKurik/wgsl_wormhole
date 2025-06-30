@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 cgmath = "0.18.0"
+dashu = "0.4.2"
 encase = { version = "0.11.0", features = ["cgmath"] }
 image = "0.25.6"
 pollster = "0.4.0"
