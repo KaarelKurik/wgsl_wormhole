@@ -1,3 +1,14 @@
+// chart index scheme:
+// first coord:
+// 0 - ambient space
+// 1 - half-throat entry
+// 2 - half-throat middle
+// second coord:
+// if first coord is 0, ambient space index
+// if first coord is 1 or 2, half-throat index
+// third coord:
+// if first coord is 1 or 2, half-edge index
+
 struct Camera {
     width: f32,
     height: f32,
@@ -5,7 +16,7 @@ struct Camera {
     frame_inv: mat3x3<f32>,
     centre: vec3<f32>,
     yfov: f32,
-    chart_index: u32,
+    chart_index: vec3<u32>,
 }
 
 struct TR3 {
@@ -14,12 +25,13 @@ struct TR3 {
 }
 
 struct SituatedTR3 {
-  chart_index: u32,
+  chart_index: vec3<u32>,
   q: vec3f,
   v: vec3f,
 }
 
 struct HalfEdge {
+    index: u32,
     prev: u32,
     next: u32,
     twin: u32,
@@ -41,37 +53,16 @@ struct HalfThroat {
 }
 
 struct LocalTriangle {
-    base: f32,
-    tip: vec2f,
-}
-
-struct TrianglePosState {
     he: HalfEdge,
+    p1: vec3f,
+    p2: vec3f,
+}
+
+struct TriangleTrafoState {
     lt: LocalTriangle,
-    pos: vec2f,
-}
-
-struct QuadIntersectRes {
-    interps: vec2f,
-    intersects: bool,
-}
-
-// (1-u)a + ub = (1-v)c + vd
-// then interps.xy = (u,v)
-fn quad_intersect(a: vec2f, b: vec2f, c: vec2f, d: vec2f) -> QuadIntersectRes {
-    let ba = b-a;
-    let cd = c-d;
-    let ca = c-a;
-    let dd = ba.x * cd.y - ba.y * cd.x;
-    if (dd == 0) {
-        return QuadIntersectRes(vec2f(), false);
-    }
-    let mm = mat2x2f(cd.y, -ba.y, -cd.x, ba.x) * (1/dd);
-    return QuadIntersectRes(mm * ca, true);
-}
-
-fn intersection_is_segmental(ir: QuadIntersectRes) -> bool {
-    return 0 <= ir.interps.x && 0 <= ir.interps.y && ir.interps.x <= 1 && ir.interps.y <= 1;
+    pos: vec3f,
+    delta: vec3f,
+    trafo: mat3x3f
 }
 
 struct TriangleIntersect {
@@ -88,58 +79,62 @@ fn local_triangle_from_halfedge(he: HalfEdge) -> LocalTriangle {
     let xn = normalize(dr);
     let tip_x = dot(dl, xn);
     let tip_y = sqrt(dot(dl, dl) - tip_x * tip_x);
-    let tip = vec2f(tip_x, tip_y);
-    return LocalTriangle(base, tip);
+    return LocalTriangle(he, vec3f(base,0,1), vec3f(tip_x, tip_y, 1));
 }
 
-fn local_triangle_step(tps: TrianglePosState, delta: vec2f) -> TrianglePosState {
-    var more_to_traverse = true;
-    var itps = tps;
-    var idelta = delta;
-    while (more_to_traverse) {
-        let rc = vec2f(itps.lt.base, 0.0);
-        let newpos = itps.pos + idelta;
-        let i0 = quad_intersect(itps.pos, newpos, vec2f(), rc);
-        if (i0.intersects && intersection_is_segmental(i0)) {
-            let new_he = half_edges[itps.he.twin];
-            let new_local_triangle = local_triangle_from_halfedge(new_he);
-            let new_pos = vec2f((1-i0.interps.y) * new_local_triangle.base, 0);
-            let new_idelta = -(1-i0.interps.x)*idelta;
-            itps = TrianglePosState(new_he, new_local_triangle, new_pos);
-            idelta = new_idelta;
-            continue;
+fn small_step(tts: TriangleTrafoState) -> TriangleTrafoState {
+    let t0 = vec3f(-tts.lt.p1.xy, 0); // twin 0, based at p1
+    let t1 = tts.lt.p1 - tts.lt.p2; // twin 1, based at p2
+    let t2 = vec3f(tts.lt.p2.xy, 0); // twin 2, based at 0
+    let extrapolated_new_pos = tts.pos + tts.delta;
+    let h0 = cross(t0, extrapolated_new_pos - tts.lt.p1).z;
+    let h1 = cross(t1, extrapolated_new_pos - tts.lt.p2).z;
+    let h2 = cross(t2, extrapolated_new_pos - vec3f(0,0,1)).z;
+    if (h0 > 0 || h1 > 0 || h2 > 0) { // we step outside the triangle
+        let d0 = cross(vec3f(0,0,1) - tts.pos, tts.delta).z;
+        let d1 = cross(tts.lt.p1 - tts.pos, tts.delta).z;
+        let d2 = cross(tts.lt.p2 - tts.pos, tts.delta).z;
+        var edge_vec = vec3f();
+        var new_he = HalfEdge();
+        if (d0 >= 0 && d1 < 0) {
+            // crosses 0
+            edge_vec = t0;
+            new_he = half_edges[tts.lt.he.twin];
+        } else if (d1 >= 0 && d2 < 0) {
+            // crosses 1
+            edge_vec = t1;
+            new_he = half_edges[half_edges[tts.lt.he.next].twin];
+        } else {
+            // crosses 2
+            edge_vec = t2;
+            new_he = half_edges[half_edges[tts.lt.he.prev].twin];
         }
-        let i1 = quad_intersect(itps.pos, newpos, rc, itps.lt.tip);
-        if (i1.intersects && intersection_is_segmental(i1)) {
-            let base_he = half_edges[itps.he.next];
-            let new_he = half_edges[base_he.twin];
-            let new_local_triangle = local_triangle_from_halfedge(new_he);
-            let new_pos = vec2f((1-i0.interps.y) * new_local_triangle.base, 0);
-            let rot_angle_cos = dot(rc, rc-itps.lt.tip)/(itps.lt.base * length(rc-itps.lt.tip));
-            let rot_angle_sin = sqrt(1-rot_angle_cos*rot_angle_cos);
-            let rotmat = mat2x2f(rot_angle_cos, rot_angle_sin, -rot_angle_sin, rot_angle_cos);
-            let new_idelta = (1-i0.interps.x) * (rotmat * idelta);
-            itps = TrianglePosState(new_he, new_local_triangle, new_pos);
-            idelta = new_idelta;
-            continue;
-        }
-        let i2 = quad_intersect(itps.pos, newpos, itps.lt.tip, vec2f());
-        if (i2.intersects && 0 <= i2.interps.x && i2.interps.x <= 1) {
-            let base_he = half_edges[itps.he.prev];
-            let new_he = half_edges[base_he.twin];
-            let new_local_triangle = local_triangle_from_halfedge(new_he);
-            let new_pos = vec2f((1-i0.interps.y) * new_local_triangle.base, 0);
-            let rot_angle_cos = dot(rc, itps.lt.tip)/(itps.lt.base * length(itps.lt.tip));
-            let rot_angle_sin = -sqrt(1-rot_angle_cos*rot_angle_cos);
-            let rotmat = mat2x2f(rot_angle_cos, rot_angle_sin, -rot_angle_sin, rot_angle_cos);
-            let new_idelta = (1-i0.interps.x) * (rotmat * idelta);
-            itps = TrianglePosState(new_he, new_local_triangle, new_pos);
-            idelta = new_idelta;
-            continue;
-        }
-        more_to_traverse = false;
+        let pos_vec = vec3f(edge_vec.xy, 1);
+        let l0le = length(t0) * length(edge_vec);
+        let cos_angle = -dot(t0, edge_vec)/l0le;
+        let sin_angle = -cross(t0,edge_vec).z/l0le;
+        let lin_transform = mat3x3f(vec3f(cos_angle, -sin_angle, 0), vec3f(sin_angle, cos_angle, 0), vec3f(0,0,1));
+        let lcol = -lin_transform * pos_vec;
+        let transform = mat3x3f(lin_transform[0], lin_transform[1], lcol);
+        let new_triangle = local_triangle_from_halfedge(new_he);
+        let modified_delta = transform * tts.delta;
+        let modified_pos = transform * tts.pos;
+        // y(modified_pos + t * modified_delta) = 0
+        // t = -y(modified_pos)/y(modified_delta)
+        let t = -modified_pos.y/modified_delta.y;
+        let new_pos = vec3f(clamp((modified_pos + t*modified_delta).x, 0.0, new_triangle.p1.x), 0, 1);
+        let new_delta = (1-t)*modified_delta;
+        return TriangleTrafoState(new_triangle, new_pos, new_delta, transform * tts.trafo);
     }
-    return TrianglePosState(itps.he, itps.lt, itps.pos + idelta);
+    return TriangleTrafoState(tts.lt, tts.pos + tts.delta, vec3f(), tts.trafo);
+}
+
+fn big_step(tts: TriangleTrafoState) -> TriangleTrafoState {
+    var w = tts;
+    while (any(abs(w.delta) > vec3f())) {
+        w = small_step(w);
+    }
+    return w;
 }
 
 fn fragpos_to_ray(camera: Camera, pos: vec2f)->SituatedTR3 {
@@ -187,11 +182,22 @@ fn cubic_velocity(points: array<vec2f, 4>, t: f32) -> vec2f {
     return 3*a;
 }
 
-struct HalfThroatTV {
-    half_throat: HalfThroat,
-    tps: TrianglePosState,
-    t: f32,
-    vel: vec3f,
+fn half_edge_to_embedded_basis(he: HalfEdge) -> mat4x4f {
+    let p0 = he.vertex;
+    let p1 = half_edges[he.next].vertex;
+    let p2 = half_edges[he.prev].vertex;
+    let b1 = normalize(p1-p0);
+    let e2 = p2-p0;
+    let b2 = normalize(e2 - dot(e2,b1)*b1);
+    let b3 = cross(b1,b2);
+    return mat4x4f(vec4f(b1,0), vec4f(b2,0), vec4f(b3,0), vec4f(p0,1));
+}
+
+fn invert_orthobasis(ob: mat4x4f) -> mat4x4f {
+    let corner = mat3x3f(ob[0].xyz, ob[1].xyz, ob[2].xyz);
+    let tcorner = transpose(corner);
+    let antitranslation = -tcorner * ob[3].xyz;
+    return mat4x4f(vec4f(tcorner[0],0), vec4f(tcorner[1],0), vec4f(tcorner[2],0), vec4f(antitranslation, 1));
 }
 
 // Justifying the move to local coords as coherent with global coords is a little tricky.
@@ -199,31 +205,58 @@ struct HalfThroatTV {
 // The metric is not necessarily preserved but the condition for parallel transport is,
 // I think, so the connection is preserved altogether.
 // So we end up tracing in a different metric but the lines stay the same.
-fn half_throat_entry(ht: HalfThroat, global_ray: vec3f, is: TriangleIntersect) -> HalfThroatTV {
-    let local_ray = (ht.gtl * vec4f(global_ray, 0)).xyz;
+fn half_throat_entry(ht: HalfThroat, global_ray: SituatedTR3, is: TriangleIntersect) -> SituatedTR3 {
+    let throat_local_ray_vel_affine = (ht.gtl * vec4f(global_ray.v, 0));
+    let embedded_basis = half_edge_to_embedded_basis(is.he);
     let e1 = half_edges[is.he.next].vertex - is.he.vertex;
     let e2 = half_edges[is.he.prev].vertex - is.he.vertex;
-    let in_normal = normalize(cross(e2, e1));
     let sv0 = simple_cubic_velocity(0);
-    let in_vel = dot(local_ray, in_normal)/length(sv0);
-    let ne1 = normalize(e1);
-    let e2rej = e2 - dot(e2,ne1) * ne1;
-    let ne2rej = normalize(e2rej);
-    let side_vel = vec2f(dot(ne1, local_ray), dot(ne2rej, local_ray));
-    let total_vel = vec3f(in_vel, side_vel); // cubic param first
-    let global_surface_pos = is.tuv.y * e1 + is.tuv.z * e2;
-    let local_pos = vec3f(0.0, dot(global_surface_pos, ne1), dot(global_surface_pos, ne2rej)); // cubic param first
-    return HalfThroatTV(
-        ht,
-        TrianglePosState(is.he, local_triangle_from_halfedge(is.he), local_pos.yz),
-        local_pos.x,
-        total_vel
+    let tri_local_ray_vel = vec3f(
+        dot(throat_local_ray_vel_affine, embedded_basis[0]),
+        dot(throat_local_ray_vel_affine, embedded_basis[1]),
+        dot(throat_local_ray_vel_affine, embedded_basis[2])
+    );
+    let chart_local_ray_vel = vec3f(tri_local_ray_vel.xy, -tri_local_ray_vel.z/length(sv0)); // cubic param last
+    let throat_local_tri_centered_intersection_pos = is.tuv.y * e1 + is.tuv.z * e2;
+    let chart_local_pos = vec3f(
+        dot(throat_local_tri_centered_intersection_pos, embedded_basis[0].xyz),
+        dot(throat_local_tri_centered_intersection_pos, embedded_basis[1].xyz),
+        0.0,
+    ); // cubic param last
+    return SituatedTR3(
+        vec3<u32>(1, ht.index, is.he.index),
+        chart_local_pos,
+        chart_local_ray_vel,
     );
 }
 
+// TODO: redo this with hysteresis
+fn half_throat_exit(throat_patch_ray: SituatedTR3) -> SituatedTR3 {
+    // spline param for pos is zero
+    let he = half_edges[throat_patch_ray.chart_index[2]];
+    let embedded_basis = half_edge_to_embedded_basis(he);
+    let sv0 = simple_cubic_velocity(0);
+    let throat_local_pos = embedded_basis * vec4f(throat_patch_ray.q, 1); // only works if spline param is zero
+    let vel_in_embedded_basis = vec4f(throat_patch_ray.v.xy, -length(sv0) * throat_patch_ray.v.z, 0);
+    let throat_local_vel = embedded_basis * vel_in_embedded_basis;
+    let ht = half_throats[throat_patch_ray.chart_index[1]];
+    let ltg = ht.ltg;
+    let global_pos = ltg * throat_local_pos;
+    let global_vel = ltg * throat_local_vel;
+    return SituatedTR3(vec3<u32>(0, ht.ambient_index, 0), global_pos.xyz, global_vel.xyz);
+}
+
+fn mid_throat_entry(throat_patch_ray: SituatedTR3) -> SituatedTR3 {
+    return SituatedTR3(vec3<u32>(2, throat_patch_ray.chart_index.yz), throat_patch_ray.q, throat_patch_ray.v);
+}
+
+fn mid_throat_exit(throat_patch_ray: SituatedTR3) -> SituatedTR3 {
+    return SituatedTR3(vec3<u32>(1, throat_patch_ray.chart_index.yz), throat_patch_ray.q, throat_patch_ray.v);
+}
 
 @binding(0) @group(0) var<uniform> camera : Camera;
-@binding(0) @group(1) var<storage> half_edges: array<HalfEdge>;
+@binding(0) @group(1) var<storage> half_throats: array<HalfThroat>;
+@binding(0) @group(2) var<storage> half_edges: array<HalfEdge>;
 
 @vertex
 fn vtx_main(@builtin(vertex_index) vertex_index : u32) -> @builtin(position) vec4f {
