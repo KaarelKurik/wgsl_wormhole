@@ -162,6 +162,20 @@ fn simple_cubic_velocity(t: f32) -> vec2f {
     return cubic_velocity(simple_throat_points, t);
 }
 
+fn extended_cubic(t: f32) -> vec2f {
+    if (t < 0) {
+        return t * simple_cubic_velocity(0) + simple_cubic(0);
+    } else if (t > 1) {
+        return (t-1) * simple_cubic_velocity(1) + simple_cubic(1);
+    } else {
+        return simple_cubic(t);
+    }
+}
+
+fn extended_cubic_velocity(t: f32) -> vec2f {
+    return simple_cubic_velocity(clamp(t, 0.0, 1.0));
+}
+
 fn cubic(points: array<vec2f, 4>, t: f32) -> vec2f {
     var a = mix(points[0], points[1], t);
     var b = mix(points[1], points[2], t);
@@ -200,29 +214,75 @@ fn invert_orthobasis(ob: mat4x4f) -> mat4x4f {
     return mat4x4f(vec4f(tcorner[0],0), vec4f(tcorner[1],0), vec4f(tcorner[2],0), vec4f(antitranslation, 1));
 }
 
+fn jac_tilde(he: HalfEdge, t: f32) -> mat3x4f {
+    let eb = half_edge_to_embedded_basis(he);
+    let vel = extended_cubic_velocity(t);
+    let p = dot(eb[2].xyz, eb[3].xyz) * eb[2];
+    let c2 = vel.x * p + vec4f(0,0,0,vel.y);
+    return mat3x4f(eb[0], eb[1], c2);
+}
+
+fn jac_tilde_pinv(he: HalfEdge, t: f32) -> mat4x3f {
+    var jt = jac_tilde(he, t);
+    jt[2] = jt[2] / dot(jt[2], jt[2]);
+    return transpose(jt);
+}
+
+fn uv_to_mesh_pos(he: HalfEdge, uv: vec2f) -> vec4f {
+    let eb = half_edge_to_embedded_basis(he);
+    return eb[3] + uv.x * eb[0] + uv.y * eb[1];
+}
+
+fn uvt_to_4pos(he: HalfEdge, uvt: vec3f) -> vec4f {
+    let eb = half_edge_to_embedded_basis(he);
+    let sc = extended_cubic(uvt.z);
+    let mesh_pos = eb[3] + uvt.x * eb[0] + uvt.y * eb[1];
+    return vec4f(sc.x * mesh_pos.xyz, sc.y);
+}
+
+fn ortho_to_uvt(he: HalfEdge, uvt: vec3f) -> mat3x3f { // JL = Jtilde, this is L
+    let eb = half_edge_to_embedded_basis(he);
+    let sc = extended_cubic(uvt.z);
+    let vel = extended_cubic_velocity(uvt.z);
+    let inv_scale = 1/sc.x;
+    let a = dot(eb[3], eb[0]) + uvt.x;
+    let b = dot(eb[3], eb[1]) + uvt.y;
+    return mat3x3f(
+        inv_scale, 0, 0,
+        0, inv_scale, 0,
+        -a * vel.x * inv_scale, -b * vel.x * inv_scale, 1
+    );
+}
+
+fn jac(he: HalfEdge, uvt: vec3f) -> mat3x4f {
+    let eb = half_edge_to_embedded_basis(he);
+    let sc = extended_cubic(uvt.z);
+    let vel = extended_cubic_velocity(uvt.z);
+    let mesh_pos = eb[3] + uvt.x * eb[0] + uvt.y * eb[1];
+    return mat3x4f(sc.x * eb[0], sc.x * eb[1], vec4f(vel.x * mesh_pos.xyz, vel.y));
+}
+
+fn jac_pinv(he: HalfEdge, uvt: vec3f) -> mat4x3f {
+    return ortho_to_uvt(he, uvt) * jac_tilde_pinv(he, uvt.z);
+}
+
 // Justifying the move to local coords as coherent with global coords is a little tricky.
 // Seems to depend on the fact that our transform is the same affine map everywhere.
 // The metric is not necessarily preserved but the condition for parallel transport is,
 // I think, so the connection is preserved altogether.
 // So we end up tracing in a different metric but the lines stay the same.
 fn half_throat_entry(ht: HalfThroat, global_ray: SituatedTR3, is: TriangleIntersect) -> SituatedTR3 {
-    let throat_local_ray_vel_affine = (ht.gtl * vec4f(global_ray.v, 0));
+    let throat_local_ray_vel_xyzw = (ht.gtl * vec4f(global_ray.v, 0));
     let embedded_basis = half_edge_to_embedded_basis(is.he);
     let e1 = half_edges[is.he.next].vertex - is.he.vertex;
     let e2 = half_edges[is.he.prev].vertex - is.he.vertex;
-    let sv0 = simple_cubic_velocity(0);
-    let tri_local_ray_vel = vec3f(
-        dot(throat_local_ray_vel_affine, embedded_basis[0]),
-        dot(throat_local_ray_vel_affine, embedded_basis[1]),
-        dot(throat_local_ray_vel_affine, embedded_basis[2])
-    );
-    let chart_local_ray_vel = vec3f(tri_local_ray_vel.xy, -tri_local_ray_vel.z/length(sv0)); // cubic param last
     let throat_local_tri_centered_intersection_pos = is.tuv.y * e1 + is.tuv.z * e2;
     let chart_local_pos = vec3f(
         dot(throat_local_tri_centered_intersection_pos, embedded_basis[0].xyz),
         dot(throat_local_tri_centered_intersection_pos, embedded_basis[1].xyz),
         0.0,
     ); // cubic param last
+    let chart_local_ray_vel = jac_pinv(is.he, chart_local_pos) * throat_local_ray_vel_xyzw;
     return SituatedTR3(
         vec3<u32>(1, ht.index, is.he.index),
         chart_local_pos,
@@ -230,15 +290,13 @@ fn half_throat_entry(ht: HalfThroat, global_ray: SituatedTR3, is: TriangleInters
     );
 }
 
-// TODO: redo this with hysteresis
+// For good hysteresis, use this when the spline param is a little negative
 fn half_throat_exit(throat_patch_ray: SituatedTR3) -> SituatedTR3 {
-    // spline param for pos is zero
     let he = half_edges[throat_patch_ray.chart_index[2]];
-    let embedded_basis = half_edge_to_embedded_basis(he);
-    let sv0 = simple_cubic_velocity(0);
-    let throat_local_pos = embedded_basis * vec4f(throat_patch_ray.q, 1); // only works if spline param is zero
-    let vel_in_embedded_basis = vec4f(throat_patch_ray.v.xy, -length(sv0) * throat_patch_ray.v.z, 0);
-    let throat_local_vel = embedded_basis * vel_in_embedded_basis;
+    let throat_local_4pos = uvt_to_4pos(he, throat_patch_ray.q);
+    let throat_local_4vel = jac(he, throat_patch_ray.q) * throat_patch_ray.v;
+    let throat_local_pos = vec4f(throat_local_4pos.xyz, 1); // we assume throat_local_4pos.w is 0, i.e. we're in the flat region
+    let throat_local_vel = vec4f(throat_local_4vel.xyz, 0); // same as above
     let ht = half_throats[throat_patch_ray.chart_index[1]];
     let ltg = ht.ltg;
     let global_pos = ltg * throat_local_pos;
