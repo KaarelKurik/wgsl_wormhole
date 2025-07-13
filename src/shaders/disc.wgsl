@@ -3,11 +3,19 @@
 // 0 - ambient space
 // 1 - half-throat entry
 // 2 - half-throat middle
+// 3 - invalidated ray
 // second coord:
 // if first coord is 0, ambient space index
 // if first coord is 1 or 2, half-throat index
 // third coord:
 // if first coord is 1 or 2, half-edge index
+
+// As a general principle we probably wanna do transitions
+// at the end of progress steps, bc we automatically get extra
+// info about where the ray came from for free and we
+// can maintain an invariant that all input rays are fully transitioned.
+
+// We assume half-edges are stored in triangle triples
 
 struct Camera {
     width: f32,
@@ -16,7 +24,7 @@ struct Camera {
     frame_inv: mat3x3<f32>,
     centre: vec3<f32>,
     yfov: f32,
-    chart_index: vec3<u32>,
+    chart_index: array<u32,3>,
 }
 
 struct TR3 {
@@ -24,10 +32,20 @@ struct TR3 {
   v: vec3f,
 }
 
+const CHART_INDEX_SIZE = 3;
 struct SituatedTR3 {
-  chart_index: vec3<u32>,
+  chart_index: array<u32,CHART_INDEX_SIZE>,
   q: vec3f,
   v: vec3f,
+}
+
+fn situatedtr3_eq(a: SituatedTR3, b: SituatedTR3) -> bool {
+    for (var i = 0; i < CHART_INDEX_SIZE; i++) {
+        if (a.chart_index[i] != b.chart_index[i]) {
+            return false;
+        }
+    }
+    return all(a.q == b.q) && all(a.v == b.v);
 }
 
 struct HalfEdge {
@@ -50,6 +68,10 @@ struct HalfThroat {
     ambient_index: u32,
     twin_index: u32,
     mesh: Mesh,
+    mid_t: f32, // other side must have same mid_t
+    hi_t: f32, // 2*mid_t - 1 > hi_t > mid_t
+    throat_to_mid_t: f32, // mid_t > throat_to_mid_t > mid_to_throat_t > 1
+    mid_to_throat_t: f32,
 }
 
 struct LocalTriangle {
@@ -62,12 +84,13 @@ struct TriangleTrafoState {
     lt: LocalTriangle,
     pos: vec3f,
     delta: vec3f,
-    trafo: mat3x3f
+    trafo: mat3x3f // old coords to new coords cumulative
 }
 
 struct TriangleIntersect {
     tuv: vec3f,
     he: HalfEdge,
+    ht_index: u32,
 }
 
 fn local_triangle_from_halfedge(he: HalfEdge) -> LocalTriangle {
@@ -162,11 +185,15 @@ fn simple_cubic_velocity(t: f32) -> vec2f {
     return cubic_velocity(simple_throat_points, t);
 }
 
+fn simple_cubic_accel(t: f32) -> vec2f {
+    return cubic_accel(simple_throat_points, t);
+}
+
 fn extended_cubic(t: f32) -> vec2f {
     if (t < 0) {
         return t * simple_cubic_velocity(0) + simple_cubic(0);
     } else if (t > 1) {
-        return (t-1) * simple_cubic_velocity(1) + simple_cubic(1);
+        return (t - 1) * simple_cubic_velocity(1) + simple_cubic(1);
     } else {
         return simple_cubic(t);
     }
@@ -174,6 +201,14 @@ fn extended_cubic(t: f32) -> vec2f {
 
 fn extended_cubic_velocity(t: f32) -> vec2f {
     return simple_cubic_velocity(clamp(t, 0.0, 1.0));
+}
+
+fn extended_cubic_accel(t: f32) -> vec2f {
+    if (t < 0 || t > 1) {
+        return vec2f();
+    } else {
+        return simple_cubic_accel(t);
+    }
 }
 
 fn cubic(points: array<vec2f, 4>, t: f32) -> vec2f {
@@ -194,6 +229,13 @@ fn cubic_velocity(points: array<vec2f, 4>, t: f32) -> vec2f {
     b = mix(b,c,t);
     a = mix(a,b,t);
     return 3*a;
+}
+
+fn cubic_accel(points: array<vec2f, 4>, t: f32) -> vec2f {
+    var a = points[2] - 2 * points[1] + points[0];
+    var b = points[3] - 2 * points[2] + points[1];
+    a = mix(a,b,t);
+    return 6*a;
 }
 
 fn half_edge_to_embedded_basis(he: HalfEdge) -> mat4x4f {
@@ -266,13 +308,31 @@ fn jac_pinv(he: HalfEdge, uvt: vec3f) -> mat4x3f {
     return ortho_to_uvt(he, uvt) * jac_tilde_pinv(he, uvt.z);
 }
 
+fn djac_dt(he: HalfEdge, uvt: vec3f, uvt_vel: vec3f) -> mat3x4f {
+    let vel = extended_cubic_velocity(uvt.z);
+    let acc = extended_cubic_accel(uvt.z);
+    let eb = half_edge_to_embedded_basis(he);
+    let mesh_pos = (eb[3] + uvt.x * eb[0] + uvt.y * eb[1]).xyz;
+    return mat3x4f(
+        vel.x * uvt_vel.z * eb[0],
+        vel.x * uvt_vel.z * eb[1],
+        vec4f(
+            acc.x * uvt_vel.z * mesh_pos
+                + vel.x * uvt_vel.x * eb[0].xyz
+                + vel.x * uvt_vel.y * eb[1].xyz,
+            acc.y * uvt_vel.z
+        )
+    );
+}
+
 // Justifying the move to local coords as coherent with global coords is a little tricky.
 // Seems to depend on the fact that our transform is the same affine map everywhere.
 // The metric is not necessarily preserved but the condition for parallel transport is,
 // I think, so the connection is preserved altogether.
 // So we end up tracing in a different metric but the lines stay the same.
-fn half_throat_entry(ht: HalfThroat, global_ray: SituatedTR3, is: TriangleIntersect) -> SituatedTR3 {
-    let throat_local_ray_vel_xyzw = (ht.gtl * vec4f(global_ray.v, 0));
+fn half_throat_entry(global_ray: SituatedTR3, is: TriangleIntersect) -> SituatedTR3 {
+    let ht = half_throats[is.ht_index];
+    let throat_local_ray_4vel = (ht.gtl * vec4f(global_ray.v, 0));
     let embedded_basis = half_edge_to_embedded_basis(is.he);
     let e1 = half_edges[is.he.next].vertex - is.he.vertex;
     let e2 = half_edges[is.he.prev].vertex - is.he.vertex;
@@ -282,9 +342,9 @@ fn half_throat_entry(ht: HalfThroat, global_ray: SituatedTR3, is: TriangleInters
         dot(throat_local_tri_centered_intersection_pos, embedded_basis[1].xyz),
         0.0,
     ); // cubic param last
-    let chart_local_ray_vel = jac_pinv(is.he, chart_local_pos) * throat_local_ray_vel_xyzw;
+    let chart_local_ray_vel = jac_pinv(is.he, chart_local_pos) * throat_local_ray_4vel;
     return SituatedTR3(
-        vec3<u32>(1, ht.index, is.he.index),
+        array(1, ht.index, is.he.index),
         chart_local_pos,
         chart_local_ray_vel,
     );
@@ -301,20 +361,262 @@ fn half_throat_exit(throat_patch_ray: SituatedTR3) -> SituatedTR3 {
     let ltg = ht.ltg;
     let global_pos = ltg * throat_local_pos;
     let global_vel = ltg * throat_local_vel;
-    return SituatedTR3(vec3<u32>(0, ht.ambient_index, 0), global_pos.xyz, global_vel.xyz);
+    return SituatedTR3(array(0, ht.ambient_index, 0), global_pos.xyz, global_vel.xyz);
 }
 
 fn mid_throat_entry(throat_patch_ray: SituatedTR3) -> SituatedTR3 {
-    return SituatedTR3(vec3<u32>(2, throat_patch_ray.chart_index.yz), throat_patch_ray.q, throat_patch_ray.v);
+    return SituatedTR3(array(2, throat_patch_ray.chart_index[1], throat_patch_ray.chart_index[2]), throat_patch_ray.q, throat_patch_ray.v);
 }
 
 fn mid_throat_exit(throat_patch_ray: SituatedTR3) -> SituatedTR3 {
-    return SituatedTR3(vec3<u32>(1, throat_patch_ray.chart_index.yz), throat_patch_ray.q, throat_patch_ray.v);
+    return SituatedTR3(array(1, throat_patch_ray.chart_index[1], throat_patch_ray.chart_index[2]), throat_patch_ray.q, throat_patch_ray.v);
 }
 
-@binding(0) @group(0) var<uniform> camera : Camera;
-@binding(0) @group(1) var<storage> half_throats: array<HalfThroat>;
-@binding(0) @group(2) var<storage> half_edges: array<HalfEdge>;
+fn mid_throat_transition(throat_patch_ray: SituatedTR3) -> SituatedTR3 {
+    let ht = half_throats[throat_patch_ray.chart_index[1]];
+    return SituatedTR3(
+        array(throat_patch_ray.chart_index[0], ht.twin_index, throat_patch_ray.chart_index[2]),
+        vec3f(throat_patch_ray.q.xy, 2*ht.mid_t - throat_patch_ray.q.z),
+        vec3f(throat_patch_ray.v.xy, -throat_patch_ray.v.z)
+    );
+}
+
+fn phase_vel(he: HalfEdge, qv: mat2x3f) -> mat2x3f {
+    let djdt = djac_dt(he, qv[0], qv[1]);
+    let jpinv = jac_pinv(he, qv[0]);
+    return mat2x3f(qv[1], -jpinv * (djdt * qv[1]));
+}
+
+// only rk4 + triangle steppin
+fn throat_step(throat_patch_ray: SituatedTR3, dt: f32) -> SituatedTR3 {
+    let he = half_edges[throat_patch_ray.chart_index[2]];
+    let qv0 = mat2x3f(throat_patch_ray.q, throat_patch_ray.v);
+    let k1 = phase_vel(he, qv0);
+    let k2 = phase_vel(he, qv0 + (dt/2)*k1);
+    let k3 = phase_vel(he, qv0 + (dt/2)*k2);
+    let k4 = phase_vel(he, qv0 + (dt)*k3);
+    let delta = (dt/6)*(k1 + 2*k2 + 2*k3 + k4);
+    let mesh_pos_0_affine = vec3f(qv0[0].xy, 1);
+    let mesh_delta_affine = vec3f(delta[0].xy, 0);
+    let tts = TriangleTrafoState(local_triangle_from_halfedge(he), mesh_pos_0_affine, mesh_delta_affine, mat3x3(1,0,0,0,1,0,0,0,1));
+    let ntts = big_step(tts);
+    let qv1_old_coords = qv0 + delta;
+    let mesh_qv_1_affine_old = mat2x3f(vec3f(qv1_old_coords[0].xy, 1), vec3f(qv1_old_coords[1].xy, 0));
+    let mesh_qv_1_affine_new = ntts.trafo * mesh_qv_1_affine_old;
+    let qv1_new_coords = mat2x3f(
+        vec3f(mesh_qv_1_affine_new[0].xy, qv1_old_coords[0].z),
+        vec3f(mesh_qv_1_affine_new[1].xy, qv1_old_coords[1].z)
+    ); // ideally, qv1_new_coords[0].xy == ntts.pos.xy, but numerically idk if it works out
+    // caveat emptor
+    let prelim = SituatedTR3(throat_patch_ray.chart_index, qv1_new_coords[0], qv1_new_coords[1]);
+    let ht = half_throats[prelim.chart_index[1]];
+    if (prelim.q.z > ht.throat_to_mid_t) {
+        return mid_throat_entry(prelim);
+    } else if (prelim.q.z < 0) { // tune this constant maybe
+        return half_throat_exit(prelim);
+    }
+    return prelim;
+}
+
+// May invalidate
+fn midthroat_traverse(throat_patch_ray: SituatedTR3, t_length_bound: f32) -> SituatedTR3 {
+    let ht = half_throats[throat_patch_ray.chart_index[1]];
+    let hi_target_t = 2*ht.mid_t - 1.0;
+    let lo_target_t = 1.0;
+    if (throat_patch_ray.v.z == 0) {
+        return SituatedTR3(array(3,throat_patch_ray.chart_index[1], throat_patch_ray.chart_index[2]), throat_patch_ray.q, throat_patch_ray.v);
+    }
+    let target_t = select(lo_target_t, hi_target_t, throat_patch_ray.v.z > 0);
+    let l = (target_t - throat_patch_ray.q.z)/throat_patch_ray.v.z;
+    if (abs(l) > t_length_bound) { // maybe should be abs(l * throat_patch_ray.v.z)
+        return SituatedTR3(array(3,throat_patch_ray.chart_index[1], throat_patch_ray.chart_index[2]), throat_patch_ray.q, throat_patch_ray.v);
+    }
+    let delta = l * throat_patch_ray.v;
+    let mesh_qv_0_affine = mat2x3f(vec3f(throat_patch_ray.q.xy, 1), vec3f(throat_patch_ray.v.xy, 0));
+    let he = half_edges[throat_patch_ray.chart_index[2]];
+    let tts = TriangleTrafoState(local_triangle_from_halfedge(he), mesh_qv_0_affine[0], vec3f(delta.xy, 0), mat3x3(1,0,0,0,1,0,0,0,1));
+    let ntts = big_step(tts);
+    let mesh_qv_1_affine = ntts.trafo * mesh_qv_0_affine;
+    let new_q = vec3f(mesh_qv_1_affine[0].xy, throat_patch_ray.q.z + delta.z);
+    let new_v = vec3f(mesh_qv_1_affine[1].xy, throat_patch_ray.v.z);
+    let prelim_tr3 = SituatedTR3(throat_patch_ray.chart_index, new_q, new_v);
+    if (throat_patch_ray.v.z > 0) {
+        return mid_throat_exit(mid_throat_transition(prelim_tr3));
+    }
+    return mid_throat_exit(prelim_tr3);
+}
+
+fn push_ray_step(ray: SituatedTR3) -> SituatedTR3 {
+    let dt = 0.01;
+    let t_length_bound = 50.0;
+    if (ray.chart_index[0] == 0) {
+        return process_ambient_ray(ray);
+    } else if (ray.chart_index[0] == 1) {
+        return throat_step(ray, dt);
+    } else if (ray.chart_index[0] == 2) {
+        return midthroat_traverse(ray, t_length_bound);
+    } else {
+        return ray;
+    }
+}
+
+fn push_ray(ray: SituatedTR3, max_iter: u32) -> SituatedTR3 {
+    var cur = ray;
+    for (var k = 0; k < max_iter; k++) {
+        let newRay = push_ray_step(cur);
+        if (situatedtr3_eq(newRay, cur)) {
+            return cur;
+        }
+        cur = newRay;
+    }
+    return cur;
+}
+
+// Helper function to perform ray-triangle intersection
+// Claude-gen
+fn ray_triangle_intersect(ray_origin: vec3f, ray_dir: vec3f, he: HalfEdge) -> vec3f {
+    let e1 = half_edges[he.next].vertex - he.vertex;
+    let e2 = half_edges[he.prev].vertex - he.vertex;
+    
+    let h = cross(ray_dir, e2);
+    let a = dot(e1, h);
+    
+    // Ray is parallel to triangle
+    if (abs(a) < 1e-8) {
+        return vec3f(-1.0, 0.0, 0.0); // Invalid intersection
+    }
+    
+    let f = 1.0 / a;
+    let s = ray_origin - he.vertex;
+    let u = f * dot(s, h);
+    
+    if (u < 0.0 || u > 1.0) {
+        return vec3f(-1.0, 0.0, 0.0); // Invalid intersection
+    }
+    
+    let q = cross(s, e1);
+    let v = f * dot(ray_dir, q);
+    
+    if (v < 0.0 || u + v > 1.0) {
+        return vec3f(-1.0, 0.0, 0.0); // Invalid intersection
+    }
+    
+    let t = f * dot(e2, q);
+    
+    if (t > 1e-8) { // Ray intersection
+        return vec3f(t, u, v);
+    } else {
+        return vec3f(-1.0, 0.0, 0.0); // Invalid intersection
+    }
+}
+
+// Function to find intersection with a specific half-throat mesh
+// Claude-gen
+fn intersect_half_throat_mesh(ray: SituatedTR3, ht: HalfThroat) -> TriangleIntersect {
+    var closest_intersection: TriangleIntersect;
+    var closest_t = 1e30;
+    var found_intersection = false;
+    
+    // Transform ray to throat local coordinates
+    let throat_local_origin = (ht.gtl * vec4f(ray.q, 1.0)).xyz;
+    let throat_local_dir = (ht.gtl * vec4f(ray.v, 0.0)).xyz;
+    
+    // Iterate through all triangles in the mesh
+    for (var he_idx = ht.mesh.he_lo_index; he_idx < ht.mesh.he_hi_index; he_idx += 3u) {
+        let he = half_edges[he_idx];
+        
+        // Test intersection with this triangle
+        let tuv = ray_triangle_intersect(throat_local_origin, throat_local_dir, he);
+        
+        if (tuv.x > 0.0 && tuv.x < closest_t) {
+            closest_t = tuv.x;
+            closest_intersection = TriangleIntersect(tuv, he, ht.index);
+            found_intersection = true;
+        }
+    }
+    
+    if (!found_intersection) {
+        // Return invalid intersection
+        closest_intersection.tuv = vec3f(-1.0, 0.0, 0.0);
+        closest_intersection.he = HalfEdge(0u, 0u, 0u, 0u, vec3f(0.0));
+        closest_intersection.ht_index = 0u;
+    }
+    
+    return closest_intersection;
+}
+
+// Function to find the closest intersection among all half-throats in the ambient space
+// Claude-gen
+fn find_closest_half_throat_intersection(ray: SituatedTR3) -> TriangleIntersect {
+    var closest_intersection: TriangleIntersect;
+    var closest_t = 1e30;
+    var found_intersection = false;
+    
+    let ambient_index = ray.chart_index[1];
+    
+    // Determine the range of half-throats for this ambient space
+    let start_idx = select(0u, half_throat_range_end_index[ambient_index - 1u], ambient_index > 0u);
+    let end_idx = half_throat_range_end_index[ambient_index];
+    
+    // Iterate through half-throats belonging to this ambient space
+    for (var ht_idx = start_idx; ht_idx < end_idx; ht_idx++) {
+        let ht = half_throats[ht_idx];
+        let intersection = intersect_half_throat_mesh(ray, ht, ht_idx);
+        
+        if (intersection.tuv.x > 0.0 && intersection.tuv.x < closest_t) {
+            closest_t = intersection.tuv.x;
+            closest_intersection = intersection;
+            found_intersection = true;
+        }
+    }
+    
+    if (!found_intersection) {
+        // Return invalid intersection
+        closest_intersection.tuv = vec3f(-1.0, 0.0, 0.0);
+        closest_intersection.he = HalfEdge(0u, 0u, 0u, 0u, vec3f(0.0));
+        closest_intersection.ht_index = 0u;
+    }
+    
+    return closest_intersection;
+}
+
+// Main function for ambient ray processing
+// Claude-gen
+fn process_ambient_ray(ray: SituatedTR3) -> SituatedTR3 {
+    // Only process rays that are in ambient space (chart_index[0] == 0)
+    if (ray.chart_index[0] != 0u) {
+        return ray; // Return unchanged if not in ambient space
+    }
+    
+    // Find the closest intersection with any half-throat mesh
+    let intersection = find_closest_half_throat_intersection(ray);
+    
+    // If no intersection found, return the original ray
+    if (intersection.tuv.x < 0.0) {
+        return ray;
+    }
+    
+    // Use the existing function to transform to half-throat entry coordinates
+    return half_throat_entry(ray, intersection);
+}
+
+
+// Two general situations:
+// 1. Freestanding ray
+// 2. Ray with intersection info
+// We would like to treat the latter as a transient state, so we instantly eat it
+// Processing principle:
+// 1. Given a freestanding ray, perform any applicable transitions
+// 2. Advance the ray
+// 3. Terminate when invalid, no progress, or run out of slack
+// Given this principle, advancing an ambient ray must also perform its intersection transition on its own
+
+@group(0) @binding(0) var<storage> camera : Camera;
+@group(1) @binding(0) var<storage> half_throats: array<HalfThroat>;
+@group(1) @binding(1) var<storage> half_edges: array<HalfEdge>;
+@group(1) @binding(2) var<storage> half_throat_range_end_index: array<u32>;
+@group(1) @binding(3) var skybox_textures: texture_cube_array<f32>;
+@group(1) @binding(4) var skybox_sampler: sampler;
 
 @vertex
 fn vtx_main(@builtin(vertex_index) vertex_index : u32) -> @builtin(position) vec4f {
@@ -330,5 +632,21 @@ fn vtx_main(@builtin(vertex_index) vertex_index : u32) -> @builtin(position) vec
 @fragment
 fn frag_main(@builtin(position) in : vec4<f32>) -> @location(0) vec4f {
   let ray = fragpos_to_ray(camera, in.xy);
-  return vec4f(1.0, 1.0, 0.0, 1.0);
+  let pushed = push_ray(ray, 10);
+
+  var skybox_color: vec4f;
+
+  switch pushed.chart_index[0] {
+    case 0u: {
+      // Ambient space - use ambient space index as array layer
+      let ambient_index = pushed.chart_index[1];
+      skybox_color = textureSample(skybox_textures, skybox_sampler, pushed.v, ambient_index);
+    }
+    default: {
+      // invalid case
+      skybox_color = vec4f(1.0, 1.0, 0.0, 1.0); // Yellow fallback
+    }
+  }
+  
+  return skybox_color;
 }
