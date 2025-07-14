@@ -1,6 +1,8 @@
+mod disc;
+mod test;
+
 use std::{
-    array,
-    f32::consts::{PI, TAU},
+    f32::consts::PI,
     num::NonZero,
     path::Path,
     sync::Arc,
@@ -8,8 +10,8 @@ use std::{
 };
 
 use cgmath::{Array, InnerSpace, Matrix3, Matrix4, Rad, SquareMatrix, Vector3, Zero};
-use encase::{ShaderType, StorageBuffer, UniformBuffer, internal::WriteInto};
-use image::{EncodableLayout, ImageBuffer, ImageError, RgbaImage, imageops::FilterType};
+use encase::{ShaderType, StorageBuffer, internal::WriteInto};
+use image::{EncodableLayout, ImageError, RgbaImage, imageops::FilterType};
 use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
     *,
@@ -53,65 +55,6 @@ impl<T> Keeper<T> {
     }
 }
 
-#[derive(Debug, Clone, Copy, ShaderType)]
-struct Camera {
-    width: f32,
-    height: f32,
-    frame: Matrix3<f32>,
-    frame_inv: Matrix3<f32>,
-    centre: Vector3<f32>,
-    yfov: f32,
-    chart_index: u32,
-}
-
-#[derive(Debug, Clone, Copy, ShaderType)]
-struct TR3 {
-    q: Vector3<f32>,
-    v: Vector3<f32>,
-}
-
-#[derive(Debug, Clone, Copy, ShaderType)]
-struct Hermite {
-    pos: Vector3<f32>,
-    normal: Vector3<f32>,
-}
-
-#[derive(Debug, Clone, Copy, ShaderType)]
-struct SituatedPoint {
-    chart_index: u32,
-    q: Vector3<f32>,
-}
-
-#[derive(Debug, Clone, Copy, ShaderType)]
-struct SituatedTR3 {
-    chart_index: u32,
-    q: Vector3<f32>,
-    v: Vector3<f32>,
-}
-
-#[derive(Debug, Clone, Copy, ShaderType)]
-struct SituatedTransform {
-    chart_index: u32,
-    local_to_global: Matrix4<f32>,
-    global_to_local: Matrix4<f32>,
-    global_to_local_norm: f32,
-}
-
-#[derive(Debug, Clone, Copy, ShaderType)]
-struct ThroatMetadata {
-    transforms: [SituatedTransform; 2],
-    half_throat_indices: [u32; 2],
-    point_count: u32,
-    support: f32,
-    outer_length: f32,
-}
-
-#[derive(Debug, Clone, Copy, ShaderType)]
-struct HalfThroatData {
-    throat_index: u32,
-    side: u32,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct CameraController {
     q_state: ElementState,
@@ -137,7 +80,7 @@ impl Default for CameraController {
 
 impl CameraController {
     // TODO: modify this to use the metric
-    fn update_camera(&mut self, camera: &mut Camera, dt: Duration) {
+    fn update_camera(&mut self, camera: &mut disc::Camera, dt: Duration) {
         const ANGULAR_SPEED: f32 = 1f32;
         const LINEAR_SPEED: f32 = 8f32;
         let dt_seconds = dt.as_secs_f32();
@@ -200,7 +143,7 @@ impl CameraController {
             _ => {}
         }
     }
-    fn process_mouse_motion(&mut self, camera: &mut Camera, delta: &(f64, f64)) {
+    fn process_mouse_motion(&mut self, camera: &mut disc::Camera, delta: &(f64, f64)) {
         const ANGULAR_SPEED: f32 = 0.001;
         let dx = delta.0 as f32;
         let dy = delta.1 as f32;
@@ -215,31 +158,9 @@ impl CameraController {
     }
 }
 
-// m >= 2
-fn sphere(m: usize, n: usize) -> Vec<Hermite> {
-    let mut out = Vec::with_capacity((m - 2) * n + 2);
-    out.push(Hermite {
-        pos: Vector3::unit_z(),
-        normal: Vector3::unit_z(),
-    });
-    for i in 1..(m - 1) {
-        let psi = (i as f32 / (m - 1) as f32) * PI;
-        for j in 0..n {
-            let phi = (j as f32 / n as f32) * TAU;
-            let v = Vector3::new(phi.cos() * psi.sin(), phi.sin() * psi.sin(), psi.cos());
-            out.push(Hermite { pos: v, normal: v });
-        }
-    }
-    out.push(Hermite {
-        pos: -Vector3::unit_z(),
-        normal: -Vector3::unit_z(),
-    });
-    out
-}
-
 fn interim_storage_buffer<T: ShaderType + WriteInto>(st: &T) -> StorageBuffer<Vec<u8>> {
     let mut o = StorageBuffer::new(Vec::<u8>::new());
-    o.write(st);
+    o.write(st).unwrap();
     o
 }
 
@@ -428,7 +349,7 @@ pub struct App<'a> {
     mouse_capture_mode: CursorGrabMode,
     cursor_is_visible: bool,
     camera_controller: CameraController,
-    camera: Camera,
+    camera: disc::Camera,
     render_pipeline: RenderPipeline,
     bg0: BindGroup,
     fixed_time: Instant,
@@ -476,7 +397,9 @@ impl<'a> App<'a> {
             render_pass.draw(0..3, 0..1);
         }
         let index = self.queue.submit(std::iter::once(encoder.finish()));
-        self.device.poll(MaintainBase::WaitForSubmissionIndex(index)).unwrap();
+        self.device
+            .poll(MaintainBase::WaitForSubmissionIndex(index))
+            .unwrap();
         output.present();
 
         Ok(())
@@ -547,10 +470,8 @@ impl<'a> App<'a> {
         self.fixed_time = new_time;
     }
     fn sync_logic_to_gpu(&mut self) {
-        let mut interim_buffer = UniformBuffer::new(Vec::<u8>::new());
-        interim_buffer.write(&self.camera).unwrap();
         self.queue
-            .write_buffer(&self.camera_buffer, 0, &interim_buffer.into_inner());
+            .write_buffer(&self.camera_buffer, 0, &interim_storage_buffer(&self.camera).into_inner());
     }
 }
 
@@ -647,24 +568,22 @@ impl<'a> ApplicationHandler for AppState<'a> {
 
         surface.configure(&device, &surface_config); // causes segfault if device, surface_config die.
 
-        let shader_module = device.create_shader_module(include_wgsl!("shaders/test.wgsl"));
+        let shader_module = device.create_shader_module(include_wgsl!("shaders/disc.wgsl"));
 
-        let camera = Camera {
+        let camera = disc::Camera {
             width: size.width as f32,
             height: size.height as f32,
             frame: Matrix3::identity(),
             frame_inv: Matrix3::identity(),
-            centre: Vector3::new(0.0, 0.0, -5.0),
+            centre: Vector3::new(0.0, 0.0, -8.0),
             yfov: PI / 2.0,
-            chart_index: 0,
+            chart_index: [0, 1, 0],
         };
 
-        let mut camera_interim_buffer = UniformBuffer::new(Vec::<u8>::new());
-        camera_interim_buffer.write(&camera).unwrap();
         let camera_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("camera_buffer"),
-            contents: &camera_interim_buffer.into_inner(),
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            contents: &interim_storage_buffer(&camera).into_inner(),
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
 
         let skybox_names = ["bg0", "bg_debug"];
@@ -686,7 +605,7 @@ impl<'a> ApplicationHandler for AppState<'a> {
                     binding: 0,
                     visibility: ShaderStages::all(),
                     ty: BindingType::Buffer {
-                        ty: BufferBindingType::Uniform,
+                        ty: BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -744,81 +663,54 @@ impl<'a> ApplicationHandler for AppState<'a> {
             }],
         });
 
-        let tf0 = SituatedTransform {
-            chart_index: 0,
-            local_to_global: Matrix4::identity(),
-            global_to_local: Matrix4::identity(),
-            global_to_local_norm: 1.0,
+        let tetrahedron_hes = disc::tetrahedron();
+        let mid_t = 1.5;
+        let hi_t = 1.8;
+        let throat_to_mid_t = 1.1;
+        let mid_to_throat_t = 1.05;
+
+        let ht0 = disc::HalfThroat {
+            ltg: Matrix4::identity(),
+            gtl: Matrix4::identity(),
+            index: 0,
+            ambient_index: 0,
+            twin_index: 1,
+            mesh: disc::Mesh {
+                he_lo_index: 0,
+                he_hi_index: tetrahedron_hes.len() as u32,
+            },
+            mid_t,
+            hi_t,
+            throat_to_mid_t,
+            mid_to_throat_t,
         };
 
-        let tf1 = SituatedTransform {
-            chart_index: 1,
-            local_to_global: Matrix4::identity(),
-            global_to_local: Matrix4::identity(),
-            global_to_local_norm: 1.0,
+        let ht1 = disc::HalfThroat {
+            index: 1,
+            ambient_index: 1,
+            twin_index: 0,
+            ..ht0
         };
 
-        let throat_points = sphere(40, 40);
-
-        let main_throat = ThroatMetadata {
-            transforms: [tf0, tf1],
-            half_throat_indices: [0, 1],
-            point_count: throat_points.len() as u32,
-            support: 0.3,
-            outer_length: 0.3,
-        };
-
-        let ht0 = HalfThroatData {
-            throat_index: 0,
-            side: 0,
-        };
-
-        let ht1 = HalfThroatData {
-            throat_index: 0,
-            side: 1,
-        };
-
-        let throat_metas = vec![main_throat];
-        let throat_point_starts = vec![0u32];
-        let throat_local_points = throat_points;
         let half_throats = vec![ht0, ht1];
-        let half_throat_range_start_by_chart_index = vec![0u32, 1];
-        let half_throat_range_end_by_chart_index = vec![1u32, 2];
+        let half_edges = tetrahedron_hes;
+        let half_throat_range_end_index = vec![1u32,2];
 
-        let throat_metas_buffer = device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("throat_metas_buffer"),
-            contents: &interim_storage_buffer(&throat_metas).into_inner(),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        });
-        let throat_point_starts_buffer = device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("throat_point_starts_buffer"),
-            contents: &interim_storage_buffer(&throat_point_starts).into_inner(),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        });
-        let throat_local_points_buffer = device.create_buffer_init(&BufferInitDescriptor {
-            label: Some("throat_local_points_buffer"),
-            contents: &interim_storage_buffer(&throat_local_points).into_inner(),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        });
         let half_throats_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("half_throats_buffer"),
             contents: &interim_storage_buffer(&half_throats).into_inner(),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
-        let half_throat_range_start_by_chart_index_buffer =
-            device.create_buffer_init(&BufferInitDescriptor {
-                label: Some("half_throat_range_start_by_chart_index_buffer"),
-                contents: &interim_storage_buffer(&half_throat_range_start_by_chart_index)
-                    .into_inner(),
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            });
-        let half_throat_range_end_by_chart_index_buffer =
-            device.create_buffer_init(&BufferInitDescriptor {
-                label: Some("half_throat_range_end_by_chart_index_buffer"),
-                contents: &interim_storage_buffer(&half_throat_range_end_by_chart_index)
-                    .into_inner(),
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            });
+        let half_edges_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("half_edges_buffer"),
+            contents: &interim_storage_buffer(&half_edges).into_inner(),
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        });
+        let half_throat_range_end_index_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("half_throat_range_end_index_buffer"),
+            contents: &interim_storage_buffer(&half_throat_range_end_index).into_inner(),
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        });
 
         let geometry_bind_group_layout =
             device.create_bind_group_layout(&BindGroupLayoutDescriptor {
@@ -854,36 +746,6 @@ impl<'a> ApplicationHandler for AppState<'a> {
                         },
                         count: None,
                     },
-                    BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: ShaderStages::all(),
-                        ty: BindingType::Buffer {
-                            ty: BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    BindGroupLayoutEntry {
-                        binding: 4,
-                        visibility: ShaderStages::all(),
-                        ty: BindingType::Buffer {
-                            ty: BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    BindGroupLayoutEntry {
-                        binding: 5,
-                        visibility: ShaderStages::all(),
-                        ty: BindingType::Buffer {
-                            ty: BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
                 ],
             });
 
@@ -894,7 +756,7 @@ impl<'a> ApplicationHandler for AppState<'a> {
                 BindGroupEntry {
                     binding: 0,
                     resource: BindingResource::Buffer(BufferBinding {
-                        buffer: &throat_metas_buffer,
+                        buffer: &half_throats_buffer,
                         offset: 0,
                         size: None,
                     }),
@@ -902,7 +764,7 @@ impl<'a> ApplicationHandler for AppState<'a> {
                 BindGroupEntry {
                     binding: 1,
                     resource: BindingResource::Buffer(BufferBinding {
-                        buffer: &throat_point_starts_buffer,
+                        buffer: &half_edges_buffer,
                         offset: 0,
                         size: None,
                     }),
@@ -910,31 +772,7 @@ impl<'a> ApplicationHandler for AppState<'a> {
                 BindGroupEntry {
                     binding: 2,
                     resource: BindingResource::Buffer(BufferBinding {
-                        buffer: &throat_local_points_buffer,
-                        offset: 0,
-                        size: None,
-                    }),
-                },
-                BindGroupEntry {
-                    binding: 3,
-                    resource: BindingResource::Buffer(BufferBinding {
-                        buffer: &half_throats_buffer,
-                        offset: 0,
-                        size: None,
-                    }),
-                },
-                BindGroupEntry {
-                    binding: 4,
-                    resource: BindingResource::Buffer(BufferBinding {
-                        buffer: &half_throat_range_start_by_chart_index_buffer,
-                        offset: 0,
-                        size: None,
-                    }),
-                },
-                BindGroupEntry {
-                    binding: 5,
-                    resource: BindingResource::Buffer(BufferBinding {
-                        buffer: &half_throat_range_end_by_chart_index_buffer,
+                        buffer: &half_throat_range_end_index_buffer,
                         offset: 0,
                         size: None,
                     }),

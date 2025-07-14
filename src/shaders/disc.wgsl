@@ -154,9 +154,13 @@ fn small_step(tts: TriangleTrafoState) -> TriangleTrafoState {
 
 fn big_step(tts: TriangleTrafoState) -> TriangleTrafoState {
     var w = tts;
-    while (any(abs(w.delta) > vec3f())) {
-        w = small_step(w);
-    }
+    const STEP_BOUND: u32 = 50;
+    // for (var k: u32 = 0; k < STEP_BOUND; k++) {
+      // if (any(abs(w.delta) > vec3f())) {
+        // break;
+      // }
+      w = small_step(w);
+    // }
     return w;
 }
 
@@ -392,13 +396,14 @@ fn throat_step(throat_patch_ray: SituatedTR3, dt: f32) -> SituatedTR3 {
     let he = half_edges[throat_patch_ray.chart_index[2]];
     let qv0 = mat2x3f(throat_patch_ray.q, throat_patch_ray.v);
     let k1 = phase_vel(he, qv0);
-    let k2 = phase_vel(he, qv0 + (dt/2)*k1);
-    let k3 = phase_vel(he, qv0 + (dt/2)*k2);
-    let k4 = phase_vel(he, qv0 + (dt)*k3);
-    let delta = (dt/6)*(k1 + 2*k2 + 2*k3 + k4);
+    // let k2 = phase_vel(he, qv0 + (dt/2)*k1);
+    // let k3 = phase_vel(he, qv0 + (dt/2)*k2);
+    // let k4 = phase_vel(he, qv0 + (dt)*k3);
+    // let delta = (dt/6)*(k1 + 2*k2 + 2*k3 + k4);
+    let delta = dt * k1;
     let mesh_pos_0_affine = vec3f(qv0[0].xy, 1);
     let mesh_delta_affine = vec3f(delta[0].xy, 0);
-    let tts = TriangleTrafoState(local_triangle_from_halfedge(he), mesh_pos_0_affine, mesh_delta_affine, mat3x3(1,0,0,0,1,0,0,0,1));
+    let tts = TriangleTrafoState(local_triangle_from_halfedge(he), mesh_pos_0_affine, mesh_delta_affine, mat3x3f(1,0,0,0,1,0,0,0,1));
     let ntts = big_step(tts);
     let qv1_old_coords = qv0 + delta;
     let mesh_qv_1_affine_old = mat2x3f(vec3f(qv1_old_coords[0].xy, 1), vec3f(qv1_old_coords[1].xy, 0));
@@ -434,7 +439,7 @@ fn midthroat_traverse(throat_patch_ray: SituatedTR3, t_length_bound: f32) -> Sit
     let delta = l * throat_patch_ray.v;
     let mesh_qv_0_affine = mat2x3f(vec3f(throat_patch_ray.q.xy, 1), vec3f(throat_patch_ray.v.xy, 0));
     let he = half_edges[throat_patch_ray.chart_index[2]];
-    let tts = TriangleTrafoState(local_triangle_from_halfedge(he), mesh_qv_0_affine[0], vec3f(delta.xy, 0), mat3x3(1,0,0,0,1,0,0,0,1));
+    let tts = TriangleTrafoState(local_triangle_from_halfedge(he), mesh_qv_0_affine[0], vec3f(delta.xy, 0), mat3x3f(1,0,0,0,1,0,0,0,1));
     let ntts = big_step(tts);
     let mesh_qv_1_affine = ntts.trafo * mesh_qv_0_affine;
     let new_q = vec3f(mesh_qv_1_affine[0].xy, throat_patch_ray.q.z + delta.z);
@@ -454,7 +459,8 @@ fn push_ray_step(ray: SituatedTR3) -> SituatedTR3 {
     } else if (ray.chart_index[0] == 1) {
         return throat_step(ray, dt);
     } else if (ray.chart_index[0] == 2) {
-        return midthroat_traverse(ray, t_length_bound);
+        // return midthroat_traverse(ray, t_length_bound);
+        return ray;
     } else {
         return ray;
     }
@@ -462,7 +468,7 @@ fn push_ray_step(ray: SituatedTR3) -> SituatedTR3 {
 
 fn push_ray(ray: SituatedTR3, max_iter: u32) -> SituatedTR3 {
     var cur = ray;
-    for (var k = 0; k < max_iter; k++) {
+    for (var k: u32 = 0; k < max_iter; k++) {
         let newRay = push_ray_step(cur);
         if (situatedtr3_eq(newRay, cur)) {
             return cur;
@@ -561,7 +567,7 @@ fn find_closest_half_throat_intersection(ray: SituatedTR3) -> TriangleIntersect 
     // Iterate through half-throats belonging to this ambient space
     for (var ht_idx = start_idx; ht_idx < end_idx; ht_idx++) {
         let ht = half_throats[ht_idx];
-        let intersection = intersect_half_throat_mesh(ray, ht, ht_idx);
+        let intersection = intersect_half_throat_mesh(ray, ht);
         
         if (intersection.tuv.x > 0.0 && intersection.tuv.x < closest_t) {
             closest_t = intersection.tuv.x;
@@ -612,11 +618,11 @@ fn process_ambient_ray(ray: SituatedTR3) -> SituatedTR3 {
 // Given this principle, advancing an ambient ray must also perform its intersection transition on its own
 
 @group(0) @binding(0) var<storage> camera : Camera;
-@group(1) @binding(0) var<storage> half_throats: array<HalfThroat>;
-@group(1) @binding(1) var<storage> half_edges: array<HalfEdge>;
-@group(1) @binding(2) var<storage> half_throat_range_end_index: array<u32>;
-@group(1) @binding(3) var skybox_textures: texture_cube_array<f32>;
-@group(1) @binding(4) var skybox_sampler: sampler;
+@group(0) @binding(1) var skybox_sampler: sampler;
+@group(1) @binding(0) var skybox_textures: texture_cube_array<f32>;
+@group(2) @binding(0) var<storage> half_throats: array<HalfThroat>;
+@group(2) @binding(1) var<storage> half_edges: array<HalfEdge>;
+@group(2) @binding(2) var<storage> half_throat_range_end_index: array<u32>;
 
 @vertex
 fn vtx_main(@builtin(vertex_index) vertex_index : u32) -> @builtin(position) vec4f {
@@ -632,9 +638,9 @@ fn vtx_main(@builtin(vertex_index) vertex_index : u32) -> @builtin(position) vec
 @fragment
 fn frag_main(@builtin(position) in : vec4<f32>) -> @location(0) vec4f {
   let ray = fragpos_to_ray(camera, in.xy);
-  let pushed = push_ray(ray, 10);
+  let pushed = push_ray_step(ray);
 
-  var skybox_color: vec4f;
+  var skybox_color: vec4f = vec4f(0,0,0,1);
 
   switch pushed.chart_index[0] {
     case 0u: {
