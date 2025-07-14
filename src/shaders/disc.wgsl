@@ -40,12 +40,11 @@ struct SituatedTR3 {
 }
 
 fn situatedtr3_eq(a: SituatedTR3, b: SituatedTR3) -> bool {
-    for (var i = 0; i < CHART_INDEX_SIZE; i++) {
-        if (a.chart_index[i] != b.chart_index[i]) {
-            return false;
-        }
-    }
-    return all(a.q == b.q) && all(a.v == b.v);
+  return a.chart_index[0] == b.chart_index[0] &&
+    a.chart_index[1] == b.chart_index[1] &&
+    a.chart_index[2] == b.chart_index[2] &&
+    all(a.q == b.q) &&
+    all(a.v == b.v);
 }
 
 struct HalfEdge {
@@ -152,9 +151,9 @@ fn small_step(tts: TriangleTrafoState) -> TriangleTrafoState {
     return TriangleTrafoState(tts.lt, tts.pos + tts.delta, vec3f(), tts.trafo);
 }
 
+const STEP_BOUND: u32 = 50;
 fn big_step(tts: TriangleTrafoState) -> TriangleTrafoState {
     var w = tts;
-    const STEP_BOUND: u32 = 50;
     // for (var k: u32 = 0; k < STEP_BOUND; k++) {
       // if (any(abs(w.delta) > vec3f())) {
         // break;
@@ -195,9 +194,9 @@ fn simple_cubic_accel(t: f32) -> vec2f {
 
 fn extended_cubic(t: f32) -> vec2f {
     if (t < 0) {
-        return t * simple_cubic_velocity(0) + simple_cubic(0);
+        return t * simple_cubic_velocity(0.0) + simple_cubic(0.0);
     } else if (t > 1) {
-        return (t - 1) * simple_cubic_velocity(1) + simple_cubic(1);
+        return (t - 1) * simple_cubic_velocity(1.0) + simple_cubic(1.0);
     } else {
         return simple_cubic(t);
     }
@@ -405,6 +404,7 @@ fn throat_step(throat_patch_ray: SituatedTR3, dt: f32) -> SituatedTR3 {
     let mesh_delta_affine = vec3f(delta[0].xy, 0);
     let tts = TriangleTrafoState(local_triangle_from_halfedge(he), mesh_pos_0_affine, mesh_delta_affine, mat3x3f(1,0,0,0,1,0,0,0,1));
     let ntts = big_step(tts);
+    // if bounded, need to invalidate here
     let qv1_old_coords = qv0 + delta;
     let mesh_qv_1_affine_old = mat2x3f(vec3f(qv1_old_coords[0].xy, 1), vec3f(qv1_old_coords[1].xy, 0));
     let mesh_qv_1_affine_new = ntts.trafo * mesh_qv_1_affine_old;
@@ -441,6 +441,7 @@ fn midthroat_traverse(throat_patch_ray: SituatedTR3, t_length_bound: f32) -> Sit
     let he = half_edges[throat_patch_ray.chart_index[2]];
     let tts = TriangleTrafoState(local_triangle_from_halfedge(he), mesh_qv_0_affine[0], vec3f(delta.xy, 0), mat3x3f(1,0,0,0,1,0,0,0,1));
     let ntts = big_step(tts);
+    // if bounded, need to invalidate here
     let mesh_qv_1_affine = ntts.trafo * mesh_qv_0_affine;
     let new_q = vec3f(mesh_qv_1_affine[0].xy, throat_patch_ray.q.z + delta.z);
     let new_v = vec3f(mesh_qv_1_affine[1].xy, throat_patch_ray.v.z);
@@ -626,13 +627,14 @@ fn process_ambient_ray(ray: SituatedTR3) -> SituatedTR3 {
 
 @vertex
 fn vtx_main(@builtin(vertex_index) vertex_index : u32) -> @builtin(position) vec4f {
-  const pos = array(
-    vec2( -1.0, -1.0),
-    vec2( 3.0, -1.0),
-    vec2( -1.0, 3.0)
-  );
-
-  return vec4f(pos[vertex_index], 0, 1);
+  var pos: vec2f;
+  switch vertex_index {
+    case 0u: { pos = vec2(-1.0, -1.0); }
+    case 1u: { pos = vec2(3.0, -1.0); }
+    case 2u: { pos = vec2(-1.0, 3.0); }
+    default: { pos = vec2(0.0, 0.0); }
+  }
+  return vec4f(pos, 0, 1);
 }
 
 @fragment
