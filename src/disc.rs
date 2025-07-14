@@ -1,4 +1,4 @@
-use cgmath::{Matrix3, Matrix4, Vector3};
+use cgmath::{Matrix3, Matrix4, Vector3, Vector4};
 use encase::ShaderType;
 
 #[derive(Debug, Clone, Copy, ShaderType)]
@@ -41,6 +41,13 @@ pub struct HalfThroat {
     pub(crate) mid_to_throat_t: f32,
 }
 
+#[derive(Debug, Clone, ShaderType)]
+pub struct Screen {
+    pub size: [u32; 2],
+    #[size(runtime)]
+    pub data: Vec<Vector4<f32>>,
+}
+
 pub(crate) fn tetrahedron() -> Vec<HalfEdge> {
     let verts = [
         Vector3::new(1.0, 1.0, 1.0),
@@ -74,18 +81,18 @@ pub(crate) fn tetrahedron() -> Vec<HalfEdge> {
 
     // Set up twin relationships
     let twins = [
-        (0,5),
-        (1,11),
-        (2,6),
-        (3,8),
-        (4,9),
-        (5,0),
-        (6,2),
-        (7,10),
-        (8,3),
-        (9,4),
-        (10,7),
-        (11,1)
+        (0, 5),
+        (1, 11),
+        (2, 6),
+        (3, 8),
+        (4, 9),
+        (5, 0),
+        (6, 2),
+        (7, 10),
+        (8, 3),
+        (9, 4),
+        (10, 7),
+        (11, 1),
     ];
 
     for (he_idx, twin_idx) in twins {

@@ -9,11 +9,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cgmath::{Array, InnerSpace, Matrix3, Matrix4, Rad, SquareMatrix, Vector3, Zero};
-use encase::{ShaderType, StorageBuffer, internal::WriteInto};
+use cgmath::{
+    Array, InnerSpace, Matrix3, Matrix4, Rad, SquareMatrix, Vector2, Vector3, Vector4, Zero,
+};
+use encase::{ShaderType, StorageBuffer, UniformBuffer, internal::WriteInto};
 use image::{EncodableLayout, ImageError, RgbaImage, imageops::FilterType};
 use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
+    wgt::BufferDescriptor,
     *,
 };
 use winit::{
@@ -52,6 +55,83 @@ impl<T> Keeper<T> {
 
     fn reset(&mut self) {
         self.changed = false;
+    }
+}
+
+struct ScreenBundle {
+    screen_size_buffer: Buffer,
+    screen_buffer: Buffer,
+    screen_bind_group_layout: BindGroupLayout,
+    screen_bind_group: BindGroup,
+}
+
+impl ScreenBundle {
+    fn new(device: &Device, size: PhysicalSize<u32>) -> Self {
+        let screen_size_buffer = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("screen_size_buffer"),
+            contents: &interim_uniform_buffer(&Vector2::new(size.width, size.height)).into_inner(),
+            usage: BufferUsages::UNIFORM,
+        });
+        let screen_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("screen_buffer"),
+            size: (size.width * size.height) as u64,
+            usage: BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let screen_bind_group_layout =
+            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("screen_bind_group_layout"),
+                entries: &[
+                    BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: ShaderStages::all(),
+                        ty: BindingType::Buffer {
+                            ty: BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: ShaderStages::COMPUTE | ShaderStages::FRAGMENT,
+                        ty: BindingType::Buffer {
+                            ty: BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let screen_bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("screen_bind_group"),
+            layout: &screen_bind_group_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::Buffer(BufferBinding {
+                        buffer: &screen_size_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::Buffer(BufferBinding {
+                        buffer: &screen_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+            ],
+        });
+        ScreenBundle {
+            screen_size_buffer,
+            screen_buffer,
+            screen_bind_group_layout,
+            screen_bind_group,
+        }
     }
 }
 
@@ -158,6 +238,11 @@ impl CameraController {
     }
 }
 
+fn interim_uniform_buffer<T: ShaderType + WriteInto>(st: &T) -> UniformBuffer<Vec<u8>> {
+    let mut o = UniformBuffer::new(Vec::<u8>::new());
+    o.write(st).unwrap();
+    o
+}
 fn interim_storage_buffer<T: ShaderType + WriteInto>(st: &T) -> StorageBuffer<Vec<u8>> {
     let mut o = StorageBuffer::new(Vec::<u8>::new());
     o.write(st).unwrap();
@@ -356,6 +441,8 @@ pub struct App<'a> {
     camera_buffer: Buffer,
     skyboxes_bind_group: BindGroup,
     geometry_bind_group: BindGroup,
+    compute_pipeline: ComputePipeline,
+    screen_bundle: ScreenBundle,
 }
 
 impl<'a> App<'a> {
@@ -370,6 +457,22 @@ impl<'a> App<'a> {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("encoder"),
             });
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("compute_pass"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.compute_pipeline);
+            compute_pass.set_bind_group(0, &self.bg0, &[]);
+            compute_pass.set_bind_group(1, &self.skyboxes_bind_group, &[]);
+            compute_pass.set_bind_group(2, &self.geometry_bind_group, &[]);
+            compute_pass.set_bind_group(3, &self.screen_bundle.screen_bind_group, &[]);
+            compute_pass.dispatch_workgroups(
+                (self.size.width / 16) + 1,
+                (self.size.height / 16) + 1,
+                1,
+            );
+        }
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render_pass"),
@@ -391,9 +494,10 @@ impl<'a> App<'a> {
                 occlusion_query_set: None,
             });
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, Some(&self.bg0), &[]);
-            render_pass.set_bind_group(1, Some(&self.skyboxes_bind_group), &[]);
-            render_pass.set_bind_group(2, Some(&self.geometry_bind_group), &[]);
+            render_pass.set_bind_group(0, &self.bg0, &[]);
+            render_pass.set_bind_group(1, &self.skyboxes_bind_group, &[]);
+            render_pass.set_bind_group(2, &self.geometry_bind_group, &[]);
+            render_pass.set_bind_group(3, &self.screen_bundle.screen_bind_group, &[]);
             render_pass.draw(0..3, 0..1);
         }
         let index = self.queue.submit(std::iter::once(encoder.finish()));
@@ -412,6 +516,7 @@ impl<'a> App<'a> {
             self.surface_config.width = new_size.width;
             self.surface_config.height = new_size.height;
             self.surface.configure(&self.device, &self.surface_config);
+            self.screen_bundle = ScreenBundle::new(&self.device, self.size);
         }
     }
     fn window_input(&mut self, event: &WindowEvent) {
@@ -470,8 +575,11 @@ impl<'a> App<'a> {
         self.fixed_time = new_time;
     }
     fn sync_logic_to_gpu(&mut self) {
-        self.queue
-            .write_buffer(&self.camera_buffer, 0, &interim_storage_buffer(&self.camera).into_inner());
+        self.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            &interim_storage_buffer(&self.camera).into_inner(),
+        );
     }
 }
 
@@ -694,7 +802,7 @@ impl<'a> ApplicationHandler for AppState<'a> {
 
         let half_throats = vec![ht0, ht1];
         let half_edges = tetrahedron_hes;
-        let half_throat_range_end_index = vec![1u32,2];
+        let half_throat_range_end_index = vec![1u32, 2];
 
         let half_throats_buffer = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("half_throats_buffer"),
@@ -780,12 +888,15 @@ impl<'a> ApplicationHandler for AppState<'a> {
             ],
         });
 
+        let screen_bundle = ScreenBundle::new(&device, size);
+
         let render_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("render_pipeline_layout"),
             bind_group_layouts: &[
                 &bg0_layout,
                 &skyboxes_bind_group_layout,
                 &geometry_bind_group_layout,
+                &screen_bundle.screen_bind_group_layout,
             ],
             push_constant_ranges: &[],
         });
@@ -827,6 +938,27 @@ impl<'a> ApplicationHandler for AppState<'a> {
             multiview: None,
             cache: None,
         });
+
+        let compute_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("compute_pipeline_layout"),
+            bind_group_layouts: &[
+                &bg0_layout,
+                &skyboxes_bind_group_layout,
+                &geometry_bind_group_layout,
+                &screen_bundle.screen_bind_group_layout,
+            ],
+            push_constant_ranges: &[],
+        });
+
+        let compute_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("compute_pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &shader_module,
+            entry_point: Some("compute_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         let fixed_time = Instant::now();
 
         *self = AppState::Initialized(App {
@@ -841,7 +973,9 @@ impl<'a> ApplicationHandler for AppState<'a> {
             camera,
             camera_controller: Default::default(),
             camera_buffer,
+            screen_bundle,
             render_pipeline,
+            compute_pipeline,
             bg0,
             skyboxes_bind_group,
             geometry_bind_group,

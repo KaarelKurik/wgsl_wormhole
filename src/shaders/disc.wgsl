@@ -458,7 +458,8 @@ fn push_ray_step(ray: SituatedTR3) -> SituatedTR3 {
     if (ray.chart_index[0] == 0) {
         return process_ambient_ray(ray);
     } else if (ray.chart_index[0] == 1) {
-        return throat_step(ray, dt);
+        // return throat_step(ray, dt);
+        return ray;
     } else if (ray.chart_index[0] == 2) {
         // return midthroat_traverse(ray, t_length_bound);
         return ray;
@@ -624,6 +625,8 @@ fn process_ambient_ray(ray: SituatedTR3) -> SituatedTR3 {
 @group(2) @binding(0) var<storage> half_throats: array<HalfThroat>;
 @group(2) @binding(1) var<storage> half_edges: array<HalfEdge>;
 @group(2) @binding(2) var<storage> half_throat_range_end_index: array<u32>;
+@group(3) @binding(0) var<uniform> screen_size: vec2<u32>;
+@group(3) @binding(1) var<storage, read_write> screen_data: array<vec4f>;
 
 @vertex
 fn vtx_main(@builtin(vertex_index) vertex_index : u32) -> @builtin(position) vec4f {
@@ -639,7 +642,17 @@ fn vtx_main(@builtin(vertex_index) vertex_index : u32) -> @builtin(position) vec
 
 @fragment
 fn frag_main(@builtin(position) in : vec4<f32>) -> @location(0) vec4f {
-  let ray = fragpos_to_ray(camera, in.xy);
+    let pos = vec2<u32>(in.xy);
+    let lin_color = screen_data[pos.y * screen_size.x + pos.x];
+    return lin_color;
+}
+
+@compute @workgroup_size(16, 16)
+fn compute_main(@builtin(global_invocation_id) gid: vec3<u32>)
+{
+  let cid: vec2<u32> = clamp(gid.xy, vec2<u32>(0,0), screen_size - vec2<u32>(1,1));
+  let frag_pos = vec2<f32>(cid) + vec2<f32>(0.5, 0.5);
+  let ray = fragpos_to_ray(camera, frag_pos);
   let pushed = push_ray_step(ray);
 
   var skybox_color: vec4f = vec4f(0,0,0,1);
@@ -648,13 +661,20 @@ fn frag_main(@builtin(position) in : vec4<f32>) -> @location(0) vec4f {
     case 0u: {
       // Ambient space - use ambient space index as array layer
       let ambient_index = pushed.chart_index[1];
-      skybox_color = textureSample(skybox_textures, skybox_sampler, pushed.v, ambient_index);
+      // skybox_color = textureSample(skybox_textures, skybox_sampler, pushed.v, ambient_index);
+      switch ambient_index {
+        case 0u: {
+          skybox_color = vec4f(1,0,0,1);
+        }
+        default: {
+          skybox_color = vec4f(0,0,1,1);
+        }
+      }
     }
     default: {
       // invalid case
       skybox_color = vec4f(1.0, 1.0, 0.0, 1.0); // Yellow fallback
     }
   }
-  
-  return skybox_color;
+  screen_data[cid.y * screen_size.x + cid.x] = skybox_color;
 }
